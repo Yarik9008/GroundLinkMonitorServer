@@ -9,6 +9,9 @@ import os
 from datetime import datetime
 from Logger import Logger
 
+# Размер чанка для передачи данных (64 KB) - должен совпадать с размером на клиенте
+CHUNK_SIZE = 65536
+
 
 class ImageServer:
     """Класс сервера для приема изображений от клиентов"""
@@ -53,13 +56,23 @@ class ImageServer:
             
         Returns:
             bytes: Полученные данные
+            
+        Raises:
+            ConnectionError: Если соединение разорвано
+            socket.timeout: Если превышено время ожидания
         """
         data = b''
         while len(data) < size:
-            chunk = client_socket.recv(size - len(data))
-            if not chunk:
-                raise ConnectionError("Соединение разорвано")
-            data += chunk
+            try:
+                # Читаем чанками - используем общую константу, синхронизированную с клиентом
+                chunk = client_socket.recv(min(CHUNK_SIZE, size - len(data)))
+                if not chunk:
+                    raise ConnectionError("Соединение разорвано: клиент отключился")
+                data += chunk
+            except socket.timeout:
+                raise ConnectionError(f"Таймаут при получении данных: получено {len(data)}/{size} байт")
+            except socket.error as e:
+                raise ConnectionError(f"Ошибка сокета при получении данных: {e}")
         return data
     
     def _receive_string(self, client_socket):
@@ -89,6 +102,11 @@ class ImageServer:
             client_address: Адрес клиента
         """
         try:
+            # Устанавливаем таймауты для предотвращения зависания
+            client_socket.settimeout(60.0)  # 60 секунд на операцию
+            # Отключаем алгоритм Нейгла для немедленной отправки данных
+            client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            
             self.logger.info(f"Подключен клиент: {client_address}")
             
             # Получаем имя клиента
@@ -102,6 +120,7 @@ class ImageServer:
             # Получаем размер изображения
             size_data = self._receive_data(client_socket, 4)
             image_size = struct.unpack('!I', size_data)[0]
+            
             self.logger.info(f"Клиент {client_name} ({client_address}) отправляет изображение размером {image_size} байт")
             
             # Получаем имя файла
@@ -122,18 +141,25 @@ class ImageServer:
             self.logger.info(f"Изображение сохранено: {save_path} ({len(image_data)} байт)")
             
             # Отправляем подтверждение клиенту
-            client_socket.send(b'OK')
+            client_socket.sendall(b'OK')
             
+        except ConnectionError as e:
+            self.logger.error(f"Ошибка соединения с клиентом {client_address}: {e}")
         except Exception as e:
             self.logger.error(f"Ошибка при работе с клиентом {client_address}: {e}")
         finally:
-            client_socket.close()
-            self.logger.debug(f"Соединение с клиентом {client_address} закрыто")
+            try:
+                client_socket.close()
+                self.logger.debug(f"Соединение с клиентом {client_address} закрыто")
+            except Exception as e:
+                self.logger.debug(f"Ошибка при закрытии сокета {client_address}: {e}")
     
     def start(self):
         """Запускает сервер"""
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # Устанавливаем таймаут на accept для возможности корректной остановки
+        self.server_socket.settimeout(1.0)
         
         try:
             self.server_socket.bind((self.ip, self.port))
@@ -153,6 +179,9 @@ class ImageServer:
                         daemon=True
                     )
                     client_thread.start()
+                except socket.timeout:
+                    # Таймаут на accept - это нормально, продолжаем цикл
+                    continue
                 except OSError:
                     # Сокет закрыт
                     break
