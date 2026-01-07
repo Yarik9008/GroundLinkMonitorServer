@@ -24,12 +24,10 @@ from email.mime.image import MIMEImage
 
 # Импортируем Logger
 try:
-    from Logger import Logger, loggingLevels
-    from logging import INFO
+    from Logger import Logger
     LOGGER_AVAILABLE = True
 except ImportError:
     LOGGER_AVAILABLE = False
-    from logging import INFO
 
 # Попытка импортировать aiohttp для асинхронных запросов
 try:
@@ -49,7 +47,14 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Настройка логирования с использованием Logger.py
 if LOGGER_AVAILABLE:
-    _logger_instance = Logger("lorett_monitor", "logs", INFO)
+    # Создаем директорию для логов
+    os.makedirs('logs', exist_ok=True)
+    
+    logger_config = {
+        'log_level': 'info',
+        'path_log': 'logs/lorett_monitor_'
+    }
+    _logger_instance = Logger(logger_config)
     
     # Создаем wrapper для совместимости со стандартным logging API (exc_info)
     class LoggerWrapper:

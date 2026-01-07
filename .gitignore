@@ -35,3 +35,6 @@ Thumbs.db
 
 # Systemd service (system-specific)
 *.service
+
+# Received images
+received_images/

@@ -1,136 +1,55 @@
-from verboselogs import VerboseLogger, SPAM, NOTICE, VERBOSE
-from logging import DEBUG, INFO, WARNING, ERROR, CRITICAL
-from datetime import datetime
-from os.path import exists, join
-from os import mkdir
-
-from time import gmtime
-
 import logging
 import coloredlogs
-
-
-
-loggingLevels = {
-    "spam": SPAM,
-    "debug": DEBUG,
-    "verbose": VERBOSE,
-    "info": INFO,
-    "warning": WARNING,
-    "error": ERROR,
-    "critical": CRITICAL,
-    SPAM: "spam",
-    DEBUG: "debug",
-    VERBOSE: "verbose",
-    INFO: "info",
-    WARNING: "warning",
-    ERROR: "error",
-    CRITICAL: "critical"
-}
-
+from datetime import datetime  
 
 
 class Logger:
     '''Класс отвечающий за логирование. Логи пишуться в файл, так же выводться в консоль'''
-    def __init__(self, name: str, path: str, level: int) -> None:
-        
-        self.mylogs = VerboseLogger(__name__)
-        self.level = level
 
-        self.mylogs.setLevel(self.level)
+    def __init__(self,config):
+        log_level = {'debug':logging.DEBUG,
+                     'info':logging.INFO,
+                     'warning':logging.WARNING,
+                     'critical':logging.CRITICAL,
+                     'error':logging.ERROR}
+                     
+        self.logs = logging.getLogger(__name__)
+        self.logs.setLevel(log_level[config['log_level']])
 
-        self.path = path
-
-        if self.path != "":
-            if not exists(self.path):
-                mkdir(self.path)
+        # название файла 
+        name = config['path_log'] + '-'.join('-'.join('-'.join(str(datetime.now()).split()).split('.')).split(':')) + '.log'
 
         # обработчик записи в лог-файл
-        fileName = datetime.utcnow().strftime(f"{name}_%d-%m-%Y") + ".log"
-        fileName = join(self.path, fileName)
-
-        self.file = logging.FileHandler(fileName)
-        self.fileformat = logging.Formatter("%(asctime)s:%(levelname)s:%(message)s")
-
-        logging.Formatter.converter = gmtime
-
-        self.file.setLevel(level)
+        self.file = logging.FileHandler(name)
+        self.fileformat = logging.Formatter("%(asctime)s : %(levelname)s : %(message)s")
+        self.file.setLevel(log_level[config['log_level']])
         self.file.setFormatter(self.fileformat)
 
         # обработчик вывода в консоль лог файла
         self.stream = logging.StreamHandler()
-        self.streamformat = logging.Formatter("%(levelname)s:%(module)s:%(message)s")
-
-        self.stream.setLevel(level)
+        self.streamformat = logging.Formatter(
+            "%(levelname)s:%(module)s:%(message)s")
+        self.stream.setLevel(log_level[config['log_level']])
         self.stream.setFormatter(self.streamformat)
 
         # инициализация обработчиков
-        self.mylogs.addHandler(self.file)
-        self.mylogs.addHandler(self.stream)
+        self.logs.addHandler(self.file)
+        self.logs.addHandler(self.stream)
+        coloredlogs.install(level=log_level[config['log_level']], logger=self.logs, fmt='%(asctime)s : %(levelname)s : %(message)s')
 
-        coloredlogs.install(level=level, logger=self.mylogs, fmt='%(asctime)s [%(levelname)s] %(message)s')
+        self.logs.info('Start logging') 
 
-        logging.Formatter.converter = gmtime                            
+    def debug(self, message):
+        self.logs.debug(message)
 
-        self.lastLog = {"message": " ", "source": "station"}
+    def info(self, message):
+        self.logs.info(message)
 
-        self.mylogs.info('Start Logger')
+    def warning(self, message):
+        self.logs.warning(message)
 
-    def spam(self, message: str, source: str = "station") -> None:
-        
-        if self.level <= SPAM:
-            self.lastLog["message"] = message
-            self.lastLog["source"] = source
+    def critical(self, message):
+        self.logs.critical(message)
 
-        self.mylogs.spam(message)
-    
-    def verbose(self, message: str, source: str = "station") -> None:
-        if self.level <= VERBOSE:
-            self.lastLog["message"] = message
-            self.lastLog["source"] = source
-
-        self.mylogs.verbose(message)
-
-    def notice(self, message: str, source: str = "station") -> None:
-        if self.level <= NOTICE:
-            self.lastLog["message"] = message
-            self.lastLog["source"] = source
-
-        self.mylogs.notice(message)
-
-    def debug(self, message: str, source: str = "station") -> None:
-        if self.level <= DEBUG:
-            self.lastLog["message"] = message
-            self.lastLog["source"] = source
-                            
-        self.mylogs.debug(message)
-
-
-    def info(self, message: str, source: str = "station") -> None:
-        if self.level <= INFO:
-            self.lastLog["message"] = message
-            self.lastLog["source"] = source
-
-        self.mylogs.info(message)
-
-    def warning(self, message: str, source: str = "station") -> None:
-        if self.level <= WARNING:
-            self.lastLog["message"] = message
-            self.lastLog["source"] = source
-
-        self.mylogs.warning(message)
-
-    def critical(self, message: str, source: str = "station") -> None:
-        if self.level <= CRITICAL:
-            self.lastLog["message"] = message
-            self.lastLog["source"] = source
-
-        self.mylogs.critical(message)
-        exit(-1) 
-
-    def error(self, message: str, source: str = "station") -> None:
-        if self.level <= ERROR:
-            self.lastLog["message"] = message
-            self.lastLog["source"] = source
-                        
-        self.mylogs.error(message)
+    def error(self, message):
+        self.logs.error(message)
