@@ -13,6 +13,12 @@ from Logger import Logger
 # Больший чанк снижает накладные расходы на syscalls и копирование
 CHUNK_SIZE = 1024 * 1024  # 1 MB
 
+# Таймауты (секунды)
+# Заголовок (имя клиента/размер/имя файла) должен приходить быстро,
+# а сам файл может идти долго, особенно по медленному каналу.
+HEADER_TIMEOUT = 30.0
+FILE_TRANSFER_TIMEOUT = 600.0  # 10 минут "тишины" на recv до обрыва
+
 
 class ImageServer:
     """Класс сервера для приема изображений от клиентов"""
@@ -129,8 +135,8 @@ class ImageServer:
             client_address: Адрес клиента
         """
         try:
-            # Устанавливаем таймауты для предотвращения зависания
-            client_socket.settimeout(60.0)  # 60 секунд на операцию
+            # Таймаут на заголовок/первые байты, чтобы не зависать на "мертвых" клиентах
+            client_socket.settimeout(HEADER_TIMEOUT)
             # Отключаем алгоритм Нейгла для немедленной отправки данных
             client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             # Увеличиваем размер приемного буфера для повышения производительности
@@ -164,6 +170,9 @@ class ImageServer:
             save_path = os.path.join(client_dir, save_filename)
 
             # Пишем файл потоково — быстрее и без лишней памяти/копирования
+            # Увеличиваем таймаут на саму передачу файла: он применяется как
+            # "максимальная пауза без данных" для recv(), а не как общий таймер.
+            client_socket.settimeout(FILE_TRANSFER_TIMEOUT)
             with open(save_path, 'wb', buffering=4 * 1024 * 1024) as f:
                 self._receive_to_file(client_socket, f, image_size)
 
