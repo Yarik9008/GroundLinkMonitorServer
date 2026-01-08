@@ -1,245 +1,162 @@
 #!/usr/bin/env python3
 """
-Сервер для приема изображений от нескольких клиентов
+AsyncIO сервер для приема изображений от нескольких клиентов.
+
+Протокол (совместим с клиентом из этого репозитория):
+  - client_name: uint32(len) + bytes(utf-8)
+  - image_size:  uint32 (байты)
+  - filename:    uint32(len) + bytes(utf-8)
+  - image_body:  image_size байт
+  - response:    b"OK" или b"ER"
 """
-import socket
-import threading
-import struct
+
+import asyncio
 import os
+import socket
+import struct
 from datetime import datetime
+
 from Logger import Logger
 
 # Размер чанка для передачи данных (1 MB) - должен совпадать с размером на клиенте
-# Больший чанк снижает накладные расходы на syscalls и копирование
 CHUNK_SIZE = 1024 * 1024  # 1 MB
 
-# Таймауты (секунды)
-# Заголовок (имя клиента/размер/имя файла) должен приходить быстро,
-# а сам файл может идти долго, особенно по медленному каналу.
-HEADER_TIMEOUT = 30.0
+# Буферы сокета (помогает на высоких скоростях / больших файлах)
+SOCKET_BUF = 8 * 1024 * 1024  # 8 MB
+
+
+def _set_socket_opts(sock: socket.socket) -> None:
+    # TCP_NODELAY на всякий случай; при больших чанках эффект небольшой, но не мешает
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCKET_BUF)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCKET_BUF)
+
+
+async def _read_u32(reader: asyncio.StreamReader) -> int:
+    data = await reader.readexactly(4)
+    return struct.unpack("!I", data)[0]
+
+
+async def _read_string(reader: asyncio.StreamReader) -> str:
+    n = await _read_u32(reader)
+    data = await reader.readexactly(n)
+    return data.decode("utf-8")
+
+
+async def _receive_to_file(reader: asyncio.StreamReader, file_obj, size: int) -> None:
+    remaining = size
+    while remaining > 0:
+        chunk = await reader.read(min(CHUNK_SIZE, remaining))
+        if not chunk:
+            raise ConnectionError("Соединение разорвано: клиент отключился")
+        file_obj.write(chunk)
+        remaining -= len(chunk)
 
 
 class ImageServer:
-    """Класс сервера для приема изображений от клиентов"""
-    
-    def __init__(self, ip="130.49.146.15", port=8888, images_dir="/root/lorett/GroundLinkMonitorServer/received_images", log_level="info"):
-        """
-        Инициализация сервера
-        
-        Args:
-            ip: IP адрес сервера
-            port: Порт сервера
-            images_dir: Директория для сохранения изображений
-            log_level: Уровень логирования (debug, info, warning, error, critical)
-        """
+    def __init__(
+        self,
+        ip: str = "130.49.146.15",
+        port: int = 8888,
+        images_dir: str = "/root/lorett/GroundLinkMonitorServer/received_images",
+        log_level: str = "info",
+    ):
         self.ip = ip
         self.port = port
         self.images_dir = images_dir
-        self.server_socket = None
-        self.running = False
-        
+
         # Создаем директорию для логов
         logs_dir = "/root/lorett/GroundLinkMonitorServer/logs"
         os.makedirs(logs_dir, exist_ok=True)
-        
-        # Инициализация логгера
+
         logger_config = {
-            'log_level': log_level,
-            'path_log': '/root/lorett/GroundLinkMonitorServer/logs/image_server_'
+            "log_level": log_level,
+            "path_log": "/root/lorett/GroundLinkMonitorServer/logs/image_server_",
         }
         self.logger = Logger(logger_config)
-        
-        # Создаем директорию для сохранения изображений
-        os.makedirs(self.images_dir, exist_ok=True)
-    
-    def _receive_data(self, client_socket, size):
-        """
-        Получает указанное количество байт из сокета
-        
-        Args:
-            client_socket: Сокет клиента
-            size: Количество байт для получения
-            
-        Returns:
-            bytes: Полученные данные
-            
-        Raises:
-            ConnectionError: Если соединение разорвано
-            socket.timeout: Если превышено время ожидания
-        """
-        # ВАЖНО: не используем data += chunk (квадратичное копирование).
-        buf = bytearray(size)
-        view = memoryview(buf)
-        received = 0
-        while received < size:
-            try:
-                n = client_socket.recv_into(
-                    view[received:],
-                    min(CHUNK_SIZE, size - received),
-                )
-                if n == 0:
-                    raise ConnectionError("Соединение разорвано: клиент отключился")
-                received += n
-            except socket.timeout:
-                raise ConnectionError(f"Таймаут при получении данных: получено {received}/{size} байт")
-            except socket.error as e:
-                raise ConnectionError(f"Ошибка сокета при получении данных: {e}")
-        return bytes(buf)
 
-    def _receive_to_file(self, client_socket, file_obj, size):
-        """
-        Потоково получает `size` байт и пишет в file_obj.
-        Это быстрее и не требует держать всё изображение в памяти.
-        """
-        remaining = size
-        buf = bytearray(min(CHUNK_SIZE, max(1, remaining)))
-        view = memoryview(buf)
-        while remaining > 0:
+        os.makedirs(self.images_dir, exist_ok=True)
+
+    async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        peer = writer.get_extra_info("peername")
+        sock = writer.get_extra_info("socket")
+        if isinstance(sock, socket.socket):
             try:
-                n = client_socket.recv_into(view, min(len(buf), remaining))
-                if n == 0:
-                    raise ConnectionError("Соединение разорвано: клиент отключился")
-                file_obj.write(view[:n])
-                remaining -= n
-            except socket.timeout:
-                done = size - remaining
-                raise ConnectionError(f"Таймаут при получении файла: получено {done}/{size} байт")
-            except socket.error as e:
-                raise ConnectionError(f"Ошибка сокета при получении файла: {e}")
-    
-    def _receive_string(self, client_socket):
-        """
-        Получает строку из сокета (сначала длина, затем данные)
-        
-        Args:
-            client_socket: Сокет клиента
-            
-        Returns:
-            str: Полученная строка
-        """
-        # Получаем длину строки (4 байта)
-        length_data = self._receive_data(client_socket, 4)
-        length = struct.unpack('!I', length_data)[0]
-        
-        # Получаем саму строку
-        string_data = self._receive_data(client_socket, length)
-        return string_data.decode('utf-8')
-    
-    def _handle_client(self, client_socket, client_address):
-        """
-        Обрабатывает подключение клиента
-        
-        Args:
-            client_socket: Сокет клиента
-            client_address: Адрес клиента
-        """
+                _set_socket_opts(sock)
+            except Exception:
+                # Опции могут быть недоступны на некоторых платформах/обертках
+                pass
+
         try:
-            # Таймаут на заголовок/первые байты, чтобы не зависать на "мертвых" клиентах
-            client_socket.settimeout(HEADER_TIMEOUT)
-            # Отключаем алгоритм Нейгла для немедленной отправки данных
-            client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            # Увеличиваем размер приемного буфера для повышения производительности
-            client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)  # 4 MB
-            # Увеличиваем размер отправного буфера
-            client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)  # 4 MB
-            
-            self.logger.info(f"Подключен клиент: {client_address}")
-            
-            # Получаем имя клиента
-            client_name = self._receive_string(client_socket)
+            self.logger.info(f"Подключен клиент: {peer}")
+
+            client_name = await _read_string(reader)
             self.logger.info(f"Имя клиента: {client_name}")
-            
-            # Создаем директорию для клиента
+
             client_dir = os.path.join(self.images_dir, client_name)
             os.makedirs(client_dir, exist_ok=True)
-            
-            # Получаем размер изображения
-            size_data = self._receive_data(client_socket, 4)
-            image_size = struct.unpack('!I', size_data)[0]
-            
-            self.logger.info(f"Клиент {client_name} ({client_address}) отправляет изображение размером {image_size} байт")
-            
-            # Получаем имя файла
-            filename = self._receive_string(client_socket)
+
+            image_size = await _read_u32(reader)
+            filename = await _read_string(reader)
+
+            self.logger.info(f"Клиент {client_name} ({peer}) отправляет изображение размером {image_size} байт")
             self.logger.debug(f"Имя файла: {filename}")
 
-            # Сохраняем изображение в папку клиента
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             save_filename = f"{timestamp}_{filename}"
             save_path = os.path.join(client_dir, save_filename)
 
-            # Пишем файл потоково — быстрее и без лишней памяти/копирования
-            # Убираем таймаут на передачу изображения: recv() может ждать сколько угодно.
-            client_socket.settimeout(None)
-            with open(save_path, 'wb', buffering=4 * 1024 * 1024) as f:
-                self._receive_to_file(client_socket, f, image_size)
+            with open(save_path, "wb", buffering=4 * 1024 * 1024) as f:
+                await _receive_to_file(reader, f, image_size)
 
             self.logger.info(f"Изображение сохранено: {save_path} ({image_size} байт)")
-            
-            # Отправляем подтверждение клиенту
-            client_socket.sendall(b'OK')
-            
-        except ConnectionError as e:
-            self.logger.error(f"Ошибка соединения с клиентом {client_address}: {e}")
+
+            writer.write(b"OK")
+            await writer.drain()
+        except (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError, ConnectionError) as e:
+            self.logger.error(f"Ошибка соединения с клиентом {peer}: {e}")
+            try:
+                writer.write(b"ER")
+                await writer.drain()
+            except Exception:
+                pass
         except Exception as e:
-            self.logger.error(f"Ошибка при работе с клиентом {client_address}: {e}")
+            self.logger.error(f"Ошибка при работе с клиентом {peer}: {e}")
+            try:
+                writer.write(b"ER")
+                await writer.drain()
+            except Exception:
+                pass
         finally:
             try:
-                client_socket.close()
-                self.logger.debug(f"Соединение с клиентом {client_address} закрыто")
-            except Exception as e:
-                self.logger.debug(f"Ошибка при закрытии сокета {client_address}: {e}")
-    
-    def start(self):
-        """Запускает сервер"""
-        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        # Устанавливаем таймаут на accept для возможности корректной остановки
-        self.server_socket.settimeout(1.0)
-        
-        try:
-            # Увеличиваем размер приемного буфера на серверном сокете
-            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)  # 4 MB
-            # Увеличиваем размер очереди подключений
-            self.server_socket.bind((self.ip, self.port))
-            self.server_socket.listen(10)  # Увеличено с 5 до 10
-            self.running = True
-            
-            self.logger.info(f"Сервер запущен на {self.ip}:{self.port}")
-            self.logger.info("Ожидание подключений...")
-            
-            while self.running:
-                try:
-                    client_socket, client_address = self.server_socket.accept()
-                    # Создаем новый поток для обработки клиента
-                    client_thread = threading.Thread(
-                        target=self._handle_client,
-                        args=(client_socket, client_address),
-                        daemon=True
-                    )
-                    client_thread.start()
-                except socket.timeout:
-                    # Таймаут на accept - это нормально, продолжаем цикл
-                    continue
-                except OSError:
-                    # Сокет закрыт
-                    break
-                    
-        except KeyboardInterrupt:
-            self.logger.info("Сервер остановлен пользователем")
-        except Exception as e:
-            self.logger.error(f"Ошибка сервера: {e}")
-        finally:
-            self.stop()
-    
-    def stop(self):
-        """Останавливает сервер"""
-        self.running = False
-        if self.server_socket:
-            self.server_socket.close()
-            self.logger.info("Сокет сервера закрыт")
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    async def start(self) -> None:
+        server = await asyncio.start_server(
+            self.handle_client,
+            host=self.ip,
+            port=self.port,
+            backlog=socket.SOMAXCONN,
+        )
+
+        # Настраиваем listening socket (recvbuf)
+        for s in server.sockets or []:
+            try:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCKET_BUF)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCKET_BUF)
+            except Exception:
+                pass
+
+        addrs = ", ".join(str(s.getsockname()) for s in (server.sockets or []))
+        self.logger.info(f"Сервер запущен на {addrs}")
+        self.logger.info("Ожидание подключений...")
+
+        async with server:
+            await server.serve_forever()
 
 
 if __name__ == "__main__":
-    server = ImageServer()
-    server.start()
+    asyncio.run(ImageServer().start())
