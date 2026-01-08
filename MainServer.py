@@ -27,6 +27,10 @@ CHUNK_SIZE = 4 * 1024 * 1024  # 4 MB
 # Буферы сокета (помогает на высоких скоростях / больших файлах)
 SOCKET_BUF = 8 * 1024 * 1024  # 8 MB
 
+# Таймаут "тишины" при приёме: если клиент/канал завис и байты не приходят,
+# мы разрываем обработку, чтобы освободить lock и дать клиенту переподключиться.
+FILE_IDLE_TIMEOUT = 60.0  # сек
+
 
 def _set_socket_opts(sock: socket.socket) -> None:
     # TCP_NODELAY на всякий случай; при больших чанках эффект небольшой, но не мешает
@@ -65,12 +69,14 @@ async def _receive_to_file(reader: asyncio.StreamReader, file_obj, size: int) ->
     while remaining > 0:
         n = min(CHUNK_SIZE, remaining)
         try:
-            chunk = await reader.readexactly(n)
+            chunk = await asyncio.wait_for(reader.readexactly(n), timeout=FILE_IDLE_TIMEOUT)
         except asyncio.IncompleteReadError as e:
             if e.partial:
                 file_obj.write(e.partial)
                 remaining -= len(e.partial)
             raise ConnectionError("Соединение разорвано: клиент отключился")
+        except asyncio.TimeoutError as e:
+            raise ConnectionError(f"Таймаут при приёме файла (нет данных > {FILE_IDLE_TIMEOUT}s)") from e
         file_obj.write(chunk)
         remaining -= n
 
