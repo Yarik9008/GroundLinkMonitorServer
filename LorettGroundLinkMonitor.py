@@ -45,67 +45,21 @@ PROGRESS_BAR_CHAR = "-"  # Можно использовать "=" или "#"
 init(autoreset=True)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Настройка логирования с использованием Logger.py
-if LOGGER_AVAILABLE:
-    # Создаем директорию для логов
-    logs_dir = "/root/lorett/GroundLinkMonitorServer/logs"
-    os.makedirs(logs_dir, exist_ok=True)
-    
-    logger_config = {
-        'log_level': 'info',
-        'path_log': '/root/lorett/GroundLinkMonitorServer/logs/lorett_monitor_'
-    }
-    _logger_instance = Logger(logger_config)
-    
-    # Создаем wrapper для совместимости со стандартным logging API (exc_info)
-    class LoggerWrapper:
-        def __init__(self, logger_instance):
-            self._logger = logger_instance
-        
-        def debug(self, message, *args, **kwargs):
-            if 'exc_info' in kwargs and kwargs['exc_info']:
-                import traceback
-                message = f"{message}\n{traceback.format_exc()}"
-            self._logger.debug(message)
-        
-        def info(self, message, *args, **kwargs):
-            if 'exc_info' in kwargs and kwargs['exc_info']:
-                import traceback
-                message = f"{message}\n{traceback.format_exc()}"
-            self._logger.info(message)
-        
-        def warning(self, message, *args, **kwargs):
-            if 'exc_info' in kwargs and kwargs['exc_info']:
-                import traceback
-                message = f"{message}\n{traceback.format_exc()}"
-            self._logger.warning(message)
-        
-        def error(self, message, *args, **kwargs):
-            if 'exc_info' in kwargs and kwargs['exc_info']:
-                import traceback
-                message = f"{message}\n{traceback.format_exc()}"
-            self._logger.error(message)
-        
-        def critical(self, message, *args, **kwargs):
-            if 'exc_info' in kwargs and kwargs['exc_info']:
-                import traceback
-                message = f"{message}\n{traceback.format_exc()}"
-            self._logger.critical(message)
-    
-    logger = LoggerWrapper(_logger_instance)
-else:
-    # Fallback на стандартное логирование если Logger.py недоступен
-    logs_dir = "/root/lorett/GroundLinkMonitorServer/logs"
-    os.makedirs(logs_dir, exist_ok=True)
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.StreamHandler(sys.stdout),
-            logging.FileHandler('/root/lorett/GroundLinkMonitorServer/lorett_monitor.log', encoding='utf-8')
-        ]
-    )
-    logger = logging.getLogger(__name__)
+# Настройка логирования - все логи в единый файл lorett_monitor.log
+log_file_path = '/root/lorett/GroundLinkMonitorServer/lorett_monitor.log'
+log_dir = os.path.dirname(log_file_path)
+os.makedirs(log_dir, exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(log_file_path, encoding='utf-8', mode='a')
+    ],
+    force=True  # Перезаписываем предыдущую конфигурацию
+)
+logger = logging.getLogger(__name__)
 
 # === Константы (загружаются из config.json с fallback на значения по умолчанию) ===
 # Значения по умолчанию используются если конфиг не найден или параметры отсутствуют
