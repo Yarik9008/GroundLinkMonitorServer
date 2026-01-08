@@ -2,12 +2,14 @@
 """
 AsyncIO сервер для приема изображений от нескольких клиентов.
 
-Протокол (совместим с клиентом из этого репозитория):
+Протокол (v2, с возобновлением передачи):
   - client_name: uint32(len) + bytes(utf-8)
-  - image_size:  uint32 (байты)
+  - file_size:   uint64 (байты)
   - filename:    uint32(len) + bytes(utf-8)
-  - image_body:  image_size байт
-  - response:    b"OK" или b"ER"
+  - upload_id:   uint32(len) + bytes(utf-8)  (стабильный id для resume)
+  - server_offset_response: uint64 (сколько байт уже есть на сервере)
+  - image_body:  (file_size - offset) байт
+  - final_response: b"OK" или b"ER"
 """
 
 import asyncio
@@ -15,6 +17,7 @@ import os
 import socket
 import struct
 from datetime import datetime
+from typing import Dict
 
 from Logger import Logger
 
@@ -36,11 +39,25 @@ async def _read_u32(reader: asyncio.StreamReader) -> int:
     data = await reader.readexactly(4)
     return struct.unpack("!I", data)[0]
 
+async def _read_u64(reader: asyncio.StreamReader) -> int:
+    data = await reader.readexactly(8)
+    return struct.unpack("!Q", data)[0]
+
 
 async def _read_string(reader: asyncio.StreamReader) -> str:
     n = await _read_u32(reader)
     data = await reader.readexactly(n)
     return data.decode("utf-8")
+
+def _write_u64(writer: asyncio.StreamWriter, value: int) -> None:
+    writer.write(struct.pack("!Q", int(value)))
+
+
+def _safe_filename(name: str) -> str:
+    # не даем клиенту писать по произвольным путям
+    base = os.path.basename(name)
+    # минимальная санитаризация
+    return base.replace("/", "_").replace("\\", "_")
 
 
 async def _receive_to_file(reader: asyncio.StreamReader, file_obj, size: int) -> None:
@@ -76,6 +93,7 @@ class ImageServer:
         self.logger = Logger(logger_config)
 
         os.makedirs(self.images_dir, exist_ok=True)
+        self._upload_locks: Dict[str, asyncio.Lock] = {}
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         peer = writer.get_extra_info("peername")
@@ -96,20 +114,79 @@ class ImageServer:
             client_dir = os.path.join(self.images_dir, client_name)
             os.makedirs(client_dir, exist_ok=True)
 
-            image_size = await _read_u32(reader)
-            filename = await _read_string(reader)
+            file_size = await _read_u64(reader)
+            filename = _safe_filename(await _read_string(reader))
+            upload_id = await _read_string(reader)
 
-            self.logger.info(f"Клиент {client_name} ({peer}) отправляет изображение размером {image_size} байт")
-            self.logger.debug(f"Имя файла: {filename}")
+            self.logger.info(
+                f"Клиент {client_name} ({peer}) отправляет файл: {filename}, size={file_size}, upload_id={upload_id}"
+            )
 
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            save_filename = f"{timestamp}_{filename}"
-            save_path = os.path.join(client_dir, save_filename)
+            # Один и тот же upload_id может переподключаться — сериализуем по upload_id
+            lock = self._upload_locks.get(upload_id)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._upload_locks[upload_id] = lock
 
-            with open(save_path, "wb", buffering=4 * 1024 * 1024) as f:
-                await _receive_to_file(reader, f, image_size)
+            async with lock:
+                done_path = os.path.join(client_dir, f"{upload_id}.done")
+                part_path = os.path.join(client_dir, f"{upload_id}_{filename}.part")
 
-            self.logger.info(f"Изображение сохранено: {save_path} ({image_size} байт)")
+                # Определяем сколько уже получено
+                if os.path.exists(done_path):
+                    existing = file_size
+                else:
+                    try:
+                        existing = os.path.getsize(part_path)
+                    except FileNotFoundError:
+                        existing = 0
+
+                # Если на диске больше, чем ожидается — сбрасываем (файл поменялся или upload_id ошибочный)
+                if existing > file_size:
+                    try:
+                        with open(part_path, "wb"):
+                            pass
+                    except FileNotFoundError:
+                        pass
+                    existing = 0
+
+                # Сообщаем клиенту оффсет, с которого продолжать
+                _write_u64(writer, existing)
+                await writer.drain()
+
+                remaining = file_size - existing
+                if remaining > 0:
+                    # Дописываем с конца
+                    with open(part_path, "r+b" if os.path.exists(part_path) else "wb", buffering=4 * 1024 * 1024) as f:
+                        f.seek(existing)
+                        await _receive_to_file(reader, f, remaining)
+
+                # Завершено: если ещё не помечено как done — финализируем.
+                # Важно: используем done-маркер, чтобы повторное подключение после обрыва
+                # (когда клиент не получил OK) не приводило к повторной загрузке.
+                if not os.path.exists(done_path):
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    final_name = f"{timestamp}_{filename}"
+                    final_path = os.path.join(client_dir, final_name)
+                    try:
+                        os.replace(part_path, final_path)
+                    except FileNotFoundError:
+                        # Если part исчез — значит параллельная очистка; считаем ошибкой
+                        raise
+                    # Записываем маркер завершения
+                    with open(done_path, "w", encoding="utf-8") as m:
+                        m.write(final_name)
+                else:
+                    # Уже завершено ранее — читаем имя финального файла для лога (если есть)
+                    final_name = "unknown"
+                    try:
+                        with open(done_path, "r", encoding="utf-8") as m:
+                            final_name = m.read().strip() or "unknown"
+                    except Exception:
+                        pass
+                    final_path = os.path.join(client_dir, final_name)
+
+            self.logger.info(f"Файл сохранён: {final_path} ({file_size} байт)")
 
             writer.write(b"OK")
             await writer.drain()
