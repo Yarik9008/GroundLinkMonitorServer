@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 from datetime import datetime
 import inspect
+import time
 
 import asyncssh
 
@@ -60,10 +61,25 @@ class MySFTPServer(asyncssh.SFTPServer):
                 'path': path
             }
         
+        total_size = None
+        try:
+            if attrs is not None and getattr(attrs, "size", None) is not None:
+                total_size = int(attrs.size)
+        except Exception:
+            total_size = None
+
         # Call parent open method (sync/async compatible)
         result = super().open(path, pflags, attrs)
         if inspect.isawaitable(result):
             result = await result
+
+        # Wrap writes with lightweight progress logging (throttled)
+        if is_write:
+            result = _ProgressFile(
+                inner=result,
+                path=path,
+                total_size=total_size,
+            )
         return result
     
     async def close(self, file_obj):
@@ -92,6 +108,51 @@ class MySFTPServer(asyncssh.SFTPServer):
         if inspect.isawaitable(result):
             result = await result
         return result
+
+
+class _ProgressFile:
+    """Wrap a server-side SFTP file object and log write progress (throttled)."""
+
+    def __init__(self, inner, path: str, total_size: int | None):
+        self._inner = inner
+        self._path = path
+        self._total_size = total_size
+        self._written = 0
+        self._last_log = time.monotonic()
+
+        # Preserve filename attribute used by our close() logging (best-effort)
+        if not hasattr(self, "_filename"):
+            self._filename = path
+
+    def __getattr__(self, item):
+        return getattr(self._inner, item)
+
+    async def write(self, data):
+        # Delegate write (sync/async compatible)
+        res = self._inner.write(data)
+        if inspect.isawaitable(res):
+            res = await res
+
+        try:
+            self._written += len(data)
+        except Exception:
+            pass
+
+        now = time.monotonic()
+        if now - self._last_log >= 1.0:
+            self._last_log = now
+            if self._total_size:
+                pct = (self._written / self._total_size) * 100
+                print(f"[server] progress {self._path}: {pct:5.1f}% ({format_bytes(self._written)}/{format_bytes(self._total_size)})")
+            else:
+                print(f"[server] progress {self._path}: {format_bytes(self._written)}")
+        return res
+
+    async def close(self):
+        res = self._inner.close()
+        if inspect.isawaitable(res):
+            res = await res
+        return res
 
 
 class MySSHServer(asyncssh.SSHServer):
