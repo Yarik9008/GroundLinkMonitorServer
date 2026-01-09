@@ -2,6 +2,7 @@
 import asyncio
 import os
 from pathlib import Path
+from datetime import datetime
 
 import asyncssh
 
@@ -20,20 +21,71 @@ SFTP_ROOT = Path("./uploads").resolve()
 BIND_HOST = SERVER_IP  # try "0.0.0.0" for local test if needed
 
 
+def format_bytes(size):
+    """Format bytes to human readable format."""
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if size < 1024.0:
+            return f"{size:.2f} {unit}"
+        size /= 1024.0
+    return f"{size:.2f} PB"
+
+
 class MySFTPServer(asyncssh.SFTPServer):
-    """Custom SFTP server that restricts access to SFTP_ROOT directory."""
+    """Custom SFTP server that restricts access to SFTP_ROOT directory with logging."""
     
     def __init__(self, conn):
         # Set root directory before calling parent __init__
         # This way asyncssh will automatically restrict all operations to this root
         root = str(SFTP_ROOT)
         super().__init__(conn, chroot=root)
+        self._active_uploads = {}
     
     def format_user(self, uid):
         return str(uid)
     
     def format_group(self, gid):
         return str(gid)
+    
+    async def open(self, path, pflags, attrs):
+        """Override open to log file operations."""
+        # Check if this is a write operation
+        is_write = bool(pflags & asyncssh.FXF_WRITE)
+        
+        if is_write:
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            print(f"[server] [{timestamp}] Receiving file: {path}")
+            self._active_uploads[path] = {
+                'start_time': datetime.now(),
+                'path': path
+            }
+        
+        # Call parent open method
+        result = await super().open(path, pflags, attrs)
+        return result
+    
+    async def close(self, file_obj):
+        """Override close to log completion."""
+        # Get file path from the file object
+        if hasattr(file_obj, '_filename'):
+            path = file_obj._filename
+            if path in self._active_uploads:
+                upload_info = self._active_uploads.pop(path)
+                elapsed = (datetime.now() - upload_info['start_time']).total_seconds()
+                
+                # Get file size
+                try:
+                    full_path = SFTP_ROOT / path.lstrip('/')
+                    if full_path.exists():
+                        size = full_path.stat().st_size
+                        speed = size / elapsed if elapsed > 0 else 0
+                        timestamp = datetime.now().strftime("%H:%M:%S")
+                        print(f"[server] [{timestamp}] ✓ Completed: {path} ({format_bytes(size)}) "
+                              f"in {elapsed:.2f}s ({format_bytes(speed)}/s)")
+                except Exception:
+                    pass
+        
+        # Call parent close method
+        return await super().close(file_obj)
 
 
 class MySSHServer(asyncssh.SSHServer):
