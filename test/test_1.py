@@ -1,19 +1,9 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Парсер для страницы https://eus.lorett.org/eus/loglist_frames.html
-Извлекает информацию о логах и фреймах из HTML страницы
-"""
-
 import requests
 from bs4 import BeautifulSoup
 import re
 from typing import List, Dict, Optional, Tuple, Union
 from urllib.parse import urljoin
 import urllib3
-
-# Отключаем предупреждения о небезопасных SSL соединениях
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 class LogListFramesParser:
@@ -27,6 +17,9 @@ class LogListFramesParser:
             base_url: Базовый URL сайта
             timeout: Таймаут для HTTP запросов в секундах
         """
+        # Отключаем предупреждения о небезопасных SSL соединениях
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
         self.base_url = base_url
         self.timeout = timeout
         self.url = urljoin(base_url, "/eus/loglist_frames.html")
@@ -44,12 +37,16 @@ class LogListFramesParser:
         Raises:
             requests.RequestException: При ошибках HTTP запроса (если raise_on_error=True)
         """
+
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
+
         r = requests.get(self.url, headers=headers, timeout=self.timeout, verify=False)
+
         if raise_on_error:
             r.raise_for_status()
+
         return r.text, r.status_code
     
     def parse(self, html: Optional[Union[str, Tuple[str, int]]] = None) -> Dict:
@@ -73,10 +70,6 @@ class LogListFramesParser:
             html, status_code = self.fetch_page(raise_on_error=False)
         elif isinstance(html, tuple):
             html, status_code = html
-        
-        # Убеждаемся, что html - это строка
-        if not isinstance(html, str):
-            raise ValueError(f"html должен быть строкой, получен: {type(html)}")
         
         soup = BeautifulSoup(html, 'html.parser')
         result = {
