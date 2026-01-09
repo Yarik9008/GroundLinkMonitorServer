@@ -1,263 +1,259 @@
 #!/usr/bin/env python3
-"""
-Минимальный пример Paramiko (SFTP server).
-
-Источник: репозиторий Paramiko — https://github.com/paramiko/paramiko
-
-Запуск (без аргументов):
-    python3 MainServer.py
-
-Файлы сохраняются в локальную папку `sftp_root/`.
-"""
-
-import logging
 import os
 import socket
-import time
-from pathlib import Path
+import threading
+import traceback
 
 import paramiko
+from paramiko import AUTH_SUCCESSFUL
+from paramiko.sftp_server import SFTPServerInterface, SFTPAttributes, SFTPHandle
+
+# ====== Static config (as requested) ======
+SERVER_IP = "130.49.146.15"
+SERVER_PORT = 1234
+USERNAME = "sftpuser"
+PASSWORD = "sftppass123"
+# =========================================
+
+# Where to store uploads on the server machine:
+SFTP_ROOT = os.path.abspath("./uploads")
+
+# If your machine does NOT own SERVER_IP, bind will fail.
+# Keep SERVER_IP static above; you can change only this bind host for local testing.
+BIND_HOST = SERVER_IP  # try "0.0.0.0" for local test if needed
 
 
-LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
-logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
-logger = logging.getLogger("sftp-server")
+def ensure_dirs():
+    os.makedirs(SFTP_ROOT, exist_ok=True)
 
-# ===== Статические настройки сервера =====
-# Важно: сервер слушает на всех интерфейсах, а подключаться к нему можно по публичному IP ниже.
-BIND_HOST = "0.0.0.0"
-PUBLIC_HOST = "130.49.146.15"
-PORT = 2222
-USERNAME = "demo"
-PASSWORD = "secret"
-HOST_KEY_PATH = Path("sftp_server_rsa.key")
-SFTP_ROOT = Path("sftp_root").resolve()
-# ========================================
 
-def ensure_host_key(path: Path) -> paramiko.PKey:
-    """Читает host key с диска или генерирует новый RSA ключ."""
-    if path.exists():
-        logger.info("Используем существующий host key: %s", path)
-        return paramiko.RSAKey(filename=str(path))
-
-    logger.info("Host key не найден, генерируем новый RSA ключ...")
-    key = paramiko.RSAKey.generate(2048)
-    key.write_private_key_file(str(path))
+def load_or_create_host_key(path="host_rsa.key", bits=2048):
+    if os.path.exists(path):
+        return paramiko.RSAKey.from_private_key_file(path)
+    key = paramiko.RSAKey.generate(bits)
+    key.write_private_key_file(path)
     return key
 
 
-class SimpleSSHServer(paramiko.ServerInterface):
-    """Минимальный SSH сервер для SFTP (password-auth)."""
+def _to_local_path(sftp_path: str) -> str:
+    """
+    Convert SFTP path like '/a/b.txt' to local path under SFTP_ROOT safely.
+    """
+    if not sftp_path:
+        sftp_path = "."
+    # normalize and prevent path traversal
+    rel = os.path.normpath(sftp_path).lstrip("/\\")
+    local = os.path.abspath(os.path.join(SFTP_ROOT, rel))
+    if not local.startswith(SFTP_ROOT):
+        raise PermissionError("Path traversal is not allowed")
+    return local
 
-    def __init__(self, allowed_user: str, allowed_password: str):
-        super().__init__()
-        self.allowed_user = allowed_user
-        self.allowed_password = allowed_password
 
-    def check_auth_password(self, username: str, password: str) -> int:
-        if username == self.allowed_user and password == self.allowed_password:
-            return paramiko.AUTH_SUCCESSFUL
+class SimpleSFTPHandle(SFTPHandle):
+    def __init__(self, flags, filename, fobj):
+        super().__init__(flags)
+        self.filename = filename
+        self.readfile = fobj
+        self.writefile = fobj
+
+
+class SimpleSFTPServer(SFTPServerInterface):
+    """
+    Minimal SFTP server mapping all operations into SFTP_ROOT directory.
+    Supports: listdir, stat/lstat, open (read/write), mkdir, rmdir, remove, rename.
+    """
+
+    def list_folder(self, path):
+        local = _to_local_path(path)
+        out = []
+        for name in os.listdir(local):
+            p = os.path.join(local, name)
+            attr = SFTPAttributes.from_stat(os.stat(p))
+            attr.filename = name
+            out.append(attr)
+        return out
+
+    def stat(self, path):
+        local = _to_local_path(path)
+        return SFTPAttributes.from_stat(os.stat(local))
+
+    def lstat(self, path):
+        local = _to_local_path(path)
+        return SFTPAttributes.from_stat(os.lstat(local))
+
+    def open(self, path, flags, attr):
+        local = _to_local_path(path)
+        parent = os.path.dirname(local)
+        os.makedirs(parent, exist_ok=True)
+
+        # Convert POSIX open flags to Python mode
+        # This is a simple mapping that works for typical uploads (write/create/truncate).
+        import errno
+
+        try:
+            if flags & os.O_WRONLY:
+                mode = "wb"
+            elif flags & os.O_RDWR:
+                mode = "r+b"
+            else:
+                mode = "rb"
+
+            # create/truncate handling
+            if flags & os.O_TRUNC:
+                mode = "wb"
+            if flags & os.O_APPEND:
+                mode = "ab"
+
+            # If file must exist but doesn't
+            if not os.path.exists(local) and not (flags & os.O_CREAT):
+                return errno.ENOENT
+
+            fobj = open(local, mode)
+            return SimpleSFTPHandle(flags, local, fobj)
+        except PermissionError:
+            return errno.EACCES
+        except FileNotFoundError:
+            return errno.ENOENT
+        except Exception:
+            return errno.EIO
+
+    def remove(self, path):
+        import errno
+        try:
+            os.remove(_to_local_path(path))
+            return paramiko.SFTP_OK
+        except FileNotFoundError:
+            return errno.ENOENT
+        except PermissionError:
+            return errno.EACCES
+        except Exception:
+            return errno.EIO
+
+    def rename(self, oldpath, newpath):
+        import errno
+        try:
+            os.rename(_to_local_path(oldpath), _to_local_path(newpath))
+            return paramiko.SFTP_OK
+        except FileNotFoundError:
+            return errno.ENOENT
+        except PermissionError:
+            return errno.EACCES
+        except Exception:
+            return errno.EIO
+
+    def mkdir(self, path, attr):
+        import errno
+        try:
+            os.makedirs(_to_local_path(path), exist_ok=True)
+            return paramiko.SFTP_OK
+        except PermissionError:
+            return errno.EACCES
+        except Exception:
+            return errno.EIO
+
+    def rmdir(self, path):
+        import errno
+        try:
+            os.rmdir(_to_local_path(path))
+            return paramiko.SFTP_OK
+        except FileNotFoundError:
+            return errno.ENOENT
+        except OSError:
+            return errno.ENOTEMPTY
+        except PermissionError:
+            return errno.EACCES
+        except Exception:
+            return errno.EIO
+
+
+class SimpleServer(paramiko.ServerInterface):
+    def __init__(self):
+        self.event = threading.Event()
+
+    def check_auth_password(self, username, password):
+        if username == USERNAME and password == PASSWORD:
+            return AUTH_SUCCESSFUL
         return paramiko.AUTH_FAILED
 
-    def get_allowed_auths(self, username: str) -> str:
+    def get_allowed_auths(self, username):
         return "password"
 
-    def check_channel_request(self, kind: str, chanid: int) -> int:
+    def check_channel_request(self, kind, chanid):
+        # SFTP uses "session" channel
         if kind == "session":
             return paramiko.OPEN_SUCCEEDED
         return paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
 
-    def check_channel_subsystem_request(self, channel: paramiko.Channel, name: str) -> bool:
-        ok = name == "sftp"
-        logger.info("subsystem request: %s -> %s", name, "OK" if ok else "DENY")
-        return ok
+    def check_channel_subsystem_request(self, channel, name):
+        # Client requests subsystem "sftp"
+        if name == "sftp":
+            return True
+        return False
 
 
-class SimpleSFTPServer(paramiko.SFTPServerInterface):
-    """SFTP сервер, работающий в пределах локальной директории root."""
-
-    def __init__(self, server, *l, **kw):
-        super().__init__(server, *l, **kw)
-        self.root = Path(kw.get("root", ".")).resolve()
-        self.root.mkdir(parents=True, exist_ok=True)
-
-    def _to_local(self, path: str) -> Path:
-        local = (self.root / path.lstrip("/")).resolve()
-        if not str(local).startswith(str(self.root)):
-            raise paramiko.SFTPServerError(paramiko.SFTP_PERMISSION_DENIED)
-        return local
-
-    def list_folder(self, path):
-        try:
-            local = self._to_local(path)
-            entries = []
-            for child in local.iterdir():
-                attr = paramiko.SFTPAttributes.from_stat(child.lstat())
-                attr.filename = child.name
-                entries.append(attr)
-            return entries
-        except FileNotFoundError:
-            return paramiko.SFTP_NO_SUCH_FILE
-        except PermissionError:
-            return paramiko.SFTP_PERMISSION_DENIED
-
-    def stat(self, path):
-        try:
-            return paramiko.SFTPAttributes.from_stat(self._to_local(path).stat())
-        except FileNotFoundError:
-            return paramiko.SFTP_NO_SUCH_FILE
-        except PermissionError:
-            return paramiko.SFTP_PERMISSION_DENIED
-
-    def lstat(self, path):
-        try:
-            return paramiko.SFTPAttributes.from_stat(self._to_local(path).lstat())
-        except FileNotFoundError:
-            return paramiko.SFTP_NO_SUCH_FILE
-        except PermissionError:
-            return paramiko.SFTP_PERMISSION_DENIED
-
-    def open(self, path, flags, attr):
-        try:
-            local = self._to_local(path)
-            if flags & os.O_CREAT:
-                local.parent.mkdir(parents=True, exist_ok=True)
-
-            mode = self._flags_to_mode(flags)
-            f = open(local, mode)
-
-            handle = paramiko.SFTPHandle(flags)
-            handle.filename = str(local)
-            # Paramiko использует readfile/writefile внутри SFTPHandle для операций read/write.
-            handle.readfile = f
-            handle.writefile = f
-            return handle
-        except FileNotFoundError:
-            return paramiko.SFTP_NO_SUCH_FILE
-        except PermissionError:
-            return paramiko.SFTP_PERMISSION_DENIED
-
-    def remove(self, path):
-        try:
-            self._to_local(path).unlink()
-        except FileNotFoundError:
-            return paramiko.SFTP_NO_SUCH_FILE
-        except PermissionError:
-            return paramiko.SFTP_PERMISSION_DENIED
-        return paramiko.SFTP_OK
-
-    def rename(self, oldpath, newpath):
-        try:
-            old = self._to_local(oldpath)
-            new = self._to_local(newpath)
-            new.parent.mkdir(parents=True, exist_ok=True)
-            old.rename(new)
-        except FileNotFoundError:
-            return paramiko.SFTP_NO_SUCH_FILE
-        except PermissionError:
-            return paramiko.SFTP_PERMISSION_DENIED
-        return paramiko.SFTP_OK
-
-    def mkdir(self, path, attr):
-        try:
-            self._to_local(path).mkdir(parents=True, exist_ok=True)
-        except PermissionError:
-            return paramiko.SFTP_PERMISSION_DENIED
-        return paramiko.SFTP_OK
-
-    def rmdir(self, path):
-        try:
-            self._to_local(path).rmdir()
-        except FileNotFoundError:
-            return paramiko.SFTP_NO_SUCH_FILE
-        except PermissionError:
-            return paramiko.SFTP_PERMISSION_DENIED
-        return paramiko.SFTP_OK
-
-    @staticmethod
-    def _flags_to_mode(flags: int) -> str:
-        readwrite = bool(flags & os.O_RDWR)
-        write_only = bool(flags & os.O_WRONLY)
-        append = bool(flags & os.O_APPEND)
-        trunc = bool(flags & os.O_TRUNC)
-
-        if readwrite:
-            mode = "r+b"
-        elif write_only:
-            mode = "wb"
-        else:
-            mode = "rb"
-
-        if trunc:
-            mode = "w+b" if readwrite else "wb"
-        if append:
-            mode = "a+b" if readwrite else "ab"
-        return mode
-
-
-def handle_one_connection(
-    client_socket: socket.socket,
-    addr,
-    host_key: paramiko.PKey,
-    server: SimpleSSHServer,
-) -> None:
-    logger.info("Подключение: %s:%s", *addr)
-    transport = paramiko.Transport(client_socket)
+def handle_client(client_sock, host_key):
+    transport = paramiko.Transport(client_sock)
     transport.add_server_key(host_key)
-    # Paramiko 4.x: SFTPServer ожидает sftp_si=<SFTPServerInterface>
-    transport.set_subsystem_handler("sftp", paramiko.SFTPServer, sftp_si=SimpleSFTPServer, root=str(SFTP_ROOT))
+    server = SimpleServer()
 
     try:
         transport.start_server(server=server)
-    except paramiko.SSHException as exc:
-        logger.error("Ошибка запуска SSH server: %s", exc)
-        return
 
-    # Держим session-канал открытым, пока жив Transport:
-    # SFTP подсистема будет запущена на этом канале.
-    logger.info("Ожидаем session-канал...")
-    channel = transport.accept(20)
-    if channel is None:
-        logger.warning("Канал не был открыт клиентом (timeout)")
-        transport.close()
-        return
-    logger.info("Session-канал открыт, ждём SFTP запросы...")
+        chan = transport.accept(20)
+        if chan is None:
+            print("[server] No channel, closing")
+            return
 
-    while transport.is_active():
-        time.sleep(0.2)
-    transport.close()
+        # Start SFTP subsystem
+        transport.set_subsystem_handler(
+            "sftp",
+            paramiko.SFTPServer,
+            SimpleSFTPServer,
+        )
+
+        # Keep connection alive until transport ends
+        while transport.is_active():
+            transport.join(1)
+
+    except Exception:
+        print("[server] Error:")
+        traceback.print_exc()
+    finally:
+        try:
+            transport.close()
+        except Exception:
+            pass
+        try:
+            client_sock.close()
+        except Exception:
+            pass
 
 
-def run_server(
-) -> None:
-    SFTP_ROOT.mkdir(parents=True, exist_ok=True)
-    host_key = ensure_host_key(HOST_KEY_PATH)
+def main():
+    ensure_dirs()
+    host_key = load_or_create_host_key()
+
+    print(f"[server] SFTP ROOT: {SFTP_ROOT}")
+    print(f"[server] Static config IP/PORT: {SERVER_IP}:{SERVER_PORT}")
+    print(f"[server] Binding on: {BIND_HOST}:{SERVER_PORT}")
+    print(f"[server] Credentials: {USERNAME} / {PASSWORD}")
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind((BIND_HOST, PORT))
+    sock.bind((BIND_HOST, SERVER_PORT))
     sock.listen(100)
 
-    logger.info("SFTP server слушает %s:%s (подключаться по %s:%s)", BIND_HOST, PORT, PUBLIC_HOST, PORT)
-    logger.info("Логин: %s, пароль: %s", USERNAME, PASSWORD)
-    logger.info("Root: %s", SFTP_ROOT)
+    print("[server] Listening...")
 
     try:
         while True:
             client, addr = sock.accept()
-            try:
-                server = SimpleSSHServer(USERNAME, PASSWORD)
-                handle_one_connection(client, addr, host_key, server)
-            finally:
-                try:
-                    client.close()
-                except Exception:
-                    pass
-    except KeyboardInterrupt:
-        logger.info("Остановка сервера по Ctrl+C")
+            print(f"[server] Connection from {addr}")
+            t = threading.Thread(target=handle_client, args=(client, host_key), daemon=True)
+            t.start()
     finally:
         sock.close()
 
 
 if __name__ == "__main__":
-    run_server()
+    main()
