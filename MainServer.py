@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import asyncio
 import os
+import signal
 from pathlib import Path
 
 import asyncssh
@@ -69,7 +70,7 @@ async def start_server():
     print(f"[server] Binding on: {BIND_HOST}:{SERVER_PORT}")
     print(f"[server] Credentials: {USERNAME} / {PASSWORD}")
 
-    await asyncssh.create_server(
+    return await asyncssh.create_server(
         LorettSFTPServer,
         BIND_HOST,
         SERVER_PORT,
@@ -81,8 +82,25 @@ async def start_server():
 
 
 async def main():
-    await start_server()
-    await asyncio.Event().wait()
+    stop_event = asyncio.Event()
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, stop_event.set)
+        except NotImplementedError:
+            # add_signal_handler isn't available on some platforms
+            pass
+
+    server = await start_server()
+    print("[server] Server started, listening for connections...")
+
+    try:
+        await stop_event.wait()
+    finally:
+        # Graceful shutdown: close listener & active connections
+        server.close()
+        await server.wait_closed()
 
 
 if __name__ == "__main__":
