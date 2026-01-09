@@ -3,6 +3,7 @@ import asyncio
 import os
 from pathlib import Path
 from datetime import datetime
+import inspect
 
 import asyncssh
 
@@ -59,8 +60,10 @@ class MySFTPServer(asyncssh.SFTPServer):
                 'path': path
             }
         
-        # Call parent open method
-        result = await super().open(path, pflags, attrs)
+        # Call parent open method (sync/async compatible)
+        result = super().open(path, pflags, attrs)
+        if inspect.isawaitable(result):
+            result = await result
         return result
     
     async def close(self, file_obj):
@@ -84,8 +87,11 @@ class MySFTPServer(asyncssh.SFTPServer):
                 except Exception:
                     pass
         
-        # Call parent close method
-        return await super().close(file_obj)
+        # Call parent close method (sync/async compatible)
+        result = super().close(file_obj)
+        if inspect.isawaitable(result):
+            result = await result
+        return result
 
 
 class MySSHServer(asyncssh.SSHServer):
