@@ -1,158 +1,55 @@
 #!/usr/bin/env python3
 """
-AsyncIO сервер для приема изображений от нескольких клиентов.
+SFTP (SSH) сервер для приёма файлов от клиентов.
 
-Протокол (v2, с возобновлением передачи):
-  - client_name: uint32(len) + bytes(utf-8)
-  - file_size:   uint64 (байты)
-  - filename:    uint32(len) + bytes(utf-8)
-  - upload_id:   uint32(len) + bytes(utf-8)  (стабильный id для resume)
-  - server_offset_response: uint64 (сколько байт уже есть на сервере)
-  - image_body:  (file_size - offset) байт
-  - final_response: b"OK" или b"ER"
+Зачем:
+- вместо собственного TCP-протокола используем стандартный SFTP
+- клиент может докачивать (resume) файл через append в `.part`, затем rename в финальный файл
+
+Куда сохраняем:
+- корень SFTP = `images_dir`
+- ожидаемый путь загрузки со стороны клиента:
+    <client_name>/<upload_id>_<filename>.part
+  после завершения клиент делает:
+    rename -> <client_name>/<timestamp>_<filename>
+    и пишет <client_name>/<upload_id>.done
 """
 
 import asyncio
 from dataclasses import dataclass
 import os
 import socket
-import struct
-from datetime import datetime
-from typing import Dict, Optional
+import threading
+import time
+from typing import Optional
 
 from Logger import Logger
+
+
+try:
+    import paramiko
+except ImportError as e:  # pragma: no cover
+    raise SystemExit(
+        "Не найдено 'paramiko'. Установите зависимости:\n"
+        "  pip install -r GroundLinkMonitorServer/requirements.txt\n"
+    ) from e
+
 
 @dataclass(frozen=True)
 class ServerConfig:
     ip: str = "130.49.146.15"
-    port: int = 8888
+    port: int = 8888  # SSH/SFTP port
     images_dir: str = "/root/lorett/GroundLinkMonitorServer/received_images"
     log_level: str = "info"
 
-    # Производительность
-    chunk_size: int = 4 * 1024 * 1024  # 4 MB
     socket_buf: int = 8 * 1024 * 1024  # 8 MB
-    stream_limit: int = 8 * 1024 * 1024  # >= chunk_size
-    file_buffering: int = 4 * 1024 * 1024
+    # Аутентификация
+    username: str = "lorett"
+    password: str = "lorett"
 
-    # Таймаут "тишины" при приёме: освобождает lock при зависшем канале
-    file_idle_timeout: float = 60.0
-
-
-class ProtocolV2:
-    """Сериализация/десериализация полей протокола v2."""
-
-    @staticmethod
-    async def read_u32(reader: asyncio.StreamReader) -> int:
-        data = await reader.readexactly(4)
-        return struct.unpack("!I", data)[0]
-
-    @staticmethod
-    async def read_u64(reader: asyncio.StreamReader) -> int:
-        data = await reader.readexactly(8)
-        return struct.unpack("!Q", data)[0]
-
-    @staticmethod
-    async def read_string(reader: asyncio.StreamReader) -> str:
-        n = await ProtocolV2.read_u32(reader)
-        data = await reader.readexactly(n)
-        return data.decode("utf-8")
-
-    @staticmethod
-    def write_u64(writer: asyncio.StreamWriter, value: int) -> None:
-        writer.write(struct.pack("!Q", int(value)))
-
-
-@dataclass(frozen=True)
-class UploadSession:
-    client_name: str
-    filename: str
-    upload_id: str
-    file_size: int
-    client_dir: str
-    part_path: str
-    done_path: str
-
-    @staticmethod
-    def safe_filename(name: str) -> str:
-        base = os.path.basename(name)
-        return base.replace("/", "_").replace("\\", "_")
-
-    @classmethod
-    def from_header(cls, images_dir: str, client_name: str, filename: str, upload_id: str, file_size: int) -> "UploadSession":
-        client_dir = os.path.join(images_dir, client_name)
-        safe = cls.safe_filename(filename)
-        part_path = os.path.join(client_dir, f"{upload_id}_{safe}.part")
-        done_path = os.path.join(client_dir, f"{upload_id}.done")
-        return cls(
-            client_name=client_name,
-            filename=safe,
-            upload_id=upload_id,
-            file_size=file_size,
-            client_dir=client_dir,
-            part_path=part_path,
-            done_path=done_path,
-        )
-
-
-class UploadManager:
-    """Управляет локами по upload_id и финализацией на диске."""
-
-    def __init__(self) -> None:
-        self._locks: Dict[str, asyncio.Lock] = {}
-
-    def lock_for(self, upload_id: str) -> asyncio.Lock:
-        lock = self._locks.get(upload_id)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._locks[upload_id] = lock
-        return lock
-
-    @staticmethod
-    def existing_offset(session: UploadSession) -> int:
-        # Если есть done-маркер — считаем завершённым
-        if os.path.exists(session.done_path):
-            return session.file_size
-        try:
-            return os.path.getsize(session.part_path)
-        except FileNotFoundError:
-            return 0
-
-    @staticmethod
-    def reset_part(session: UploadSession) -> None:
-        # Сбрасываем part, если он странный
-        try:
-            os.makedirs(session.client_dir, exist_ok=True)
-            with open(session.part_path, "wb"):
-                pass
-        except Exception:
-            pass
-
-    @staticmethod
-    def finalize(session: UploadSession) -> str:
-        """
-        Переименовывает .part в финальный файл и пишет .done.
-        Возвращает абсолютный путь финального файла.
-        """
-        os.makedirs(session.client_dir, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        final_name = f"{timestamp}_{session.filename}"
-        final_path = os.path.join(session.client_dir, final_name)
-        os.replace(session.part_path, final_path)
-        with open(session.done_path, "w", encoding="utf-8") as m:
-            m.write(final_name)
-        return final_path
-
-    @staticmethod
-    def read_final_path(session: UploadSession) -> Optional[str]:
-        try:
-            with open(session.done_path, "r", encoding="utf-8") as m:
-                final_name = (m.read() or "").strip()
-            if not final_name:
-                return None
-            return os.path.join(session.client_dir, final_name)
-        except Exception:
-            return None
+    # Host key (если файла нет — будет сгенерирован)
+    host_key_path: str = "/root/lorett/GroundLinkMonitorServer/ssh_host_rsa_key"
+    host_key_bits: int = 2048
 
 
 class SocketTuner:
@@ -165,25 +62,143 @@ class SocketTuner:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, self.socket_buf)
 
 
-class FileReceiver:
-    def __init__(self, chunk_size: int, idle_timeout: float) -> None:
-        self.chunk_size = chunk_size
-        self.idle_timeout = idle_timeout
+def _sftp_errno(exc: Exception) -> int:
+    if isinstance(exc, FileNotFoundError):
+        return paramiko.SFTP_NO_SUCH_FILE
+    if isinstance(exc, PermissionError):
+        return paramiko.SFTP_PERMISSION_DENIED
+    return paramiko.SFTP_FAILURE
 
-    async def receive_exactly_to_file(self, reader: asyncio.StreamReader, file_obj, size: int) -> None:
-        remaining = size
-        while remaining > 0:
-            n = min(self.chunk_size, remaining)
-            try:
-                chunk = await asyncio.wait_for(reader.readexactly(n), timeout=self.idle_timeout)
-            except asyncio.IncompleteReadError as e:
-                if e.partial:
-                    file_obj.write(e.partial)
-                raise ConnectionError("Соединение разорвано: клиент отключился")
-            except asyncio.TimeoutError as e:
-                raise ConnectionError(f"Таймаут при приёме файла (нет данных > {self.idle_timeout}s)") from e
-            file_obj.write(chunk)
-            remaining -= n
+
+class SimpleSFTPServer(paramiko.SFTPServerInterface):
+    def __init__(self, server, *args, root: str, logger: Logger, **kwargs):
+        super().__init__(server, *args, **kwargs)
+        self._root = os.path.abspath(root)
+        self._logger = logger
+
+    def _to_local(self, path: str) -> str:
+        # SFTP paths are typically POSIX-like. Map them under root safely.
+        p = (path or "").lstrip("/")
+        local = os.path.abspath(os.path.join(self._root, p))
+        if local != self._root and not local.startswith(self._root + os.sep):
+            raise PermissionError("path escapes root")
+        return local
+
+    def list_folder(self, path):
+        try:
+            local = self._to_local(path)
+            out = []
+            for name in os.listdir(local):
+                st = os.lstat(os.path.join(local, name))
+                attr = paramiko.SFTPAttributes.from_stat(st)
+                attr.filename = name
+                out.append(attr)
+            return out
+        except Exception as e:
+            return _sftp_errno(e)
+
+    def stat(self, path):
+        try:
+            local = self._to_local(path)
+            return paramiko.SFTPAttributes.from_stat(os.stat(local))
+        except Exception as e:
+            return _sftp_errno(e)
+
+    def lstat(self, path):
+        try:
+            local = self._to_local(path)
+            return paramiko.SFTPAttributes.from_stat(os.lstat(local))
+        except Exception as e:
+            return _sftp_errno(e)
+
+    def mkdir(self, path, attr):
+        try:
+            local = self._to_local(path)
+            os.makedirs(local, exist_ok=True)
+            return paramiko.SFTP_OK
+        except Exception as e:
+            return _sftp_errno(e)
+
+    def rmdir(self, path):
+        try:
+            local = self._to_local(path)
+            os.rmdir(local)
+            return paramiko.SFTP_OK
+        except Exception as e:
+            return _sftp_errno(e)
+
+    def remove(self, path):
+        try:
+            local = self._to_local(path)
+            os.remove(local)
+            return paramiko.SFTP_OK
+        except Exception as e:
+            return _sftp_errno(e)
+
+    def rename(self, oldpath, newpath):
+        try:
+            old_local = self._to_local(oldpath)
+            new_local = self._to_local(newpath)
+            os.makedirs(os.path.dirname(new_local), exist_ok=True)
+            os.replace(old_local, new_local)
+            return paramiko.SFTP_OK
+        except Exception as e:
+            return _sftp_errno(e)
+
+    def open(self, path, flags, attr):
+        try:
+            local = self._to_local(path)
+            os.makedirs(os.path.dirname(local), exist_ok=True)
+
+            # os.open flags are passed from SFTP client. Use them directly.
+            fd = os.open(local, flags, 0o644)
+
+            # Choose a compatible mode for fdopen.
+            # Always open in binary mode; allow both read and write if requested.
+            if flags & os.O_WRONLY:
+                mode = "ab" if (flags & os.O_APPEND) else "wb" if (flags & os.O_TRUNC) else "r+b"
+            elif flags & os.O_RDWR:
+                mode = "a+b" if (flags & os.O_APPEND) else "w+b" if (flags & os.O_TRUNC) else "r+b"
+            else:
+                mode = "rb"
+
+            f = os.fdopen(fd, mode)
+            handle = paramiko.SFTPHandle(flags)
+            handle.filename = local
+            handle.readfile = f
+            handle.writefile = f
+            return handle
+        except Exception as e:
+            return _sftp_errno(e)
+
+
+class SSHAuthServer(paramiko.ServerInterface):
+    def __init__(self, username: str, password: str, logger: Logger):
+        super().__init__()
+        self._username = username
+        self._password = password
+        self._logger = logger
+        self._sftp_requested = threading.Event()
+
+    def get_allowed_auths(self, username):
+        return "password"
+
+    def check_auth_password(self, username: str, password: str):
+        if username == self._username and password == self._password:
+            return paramiko.AUTH_SUCCESSFUL
+        self._logger.warning(f"SSH auth failed for username={username!r}")
+        return paramiko.AUTH_FAILED
+
+    def check_channel_request(self, kind: str, chanid: int):
+        if kind == "session":
+            return paramiko.OPEN_SUCCEEDED
+        return paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
+
+    def check_channel_subsystem_request(self, channel, name: str):
+        if name == "sftp":
+            self._sftp_requested.set()
+            return True
+        return False
 
 
 class ImageServer:
@@ -200,127 +215,113 @@ class ImageServer:
         self.logger = Logger(logger_config)
 
         os.makedirs(self.config.images_dir, exist_ok=True)
-        self._uploads = UploadManager()
         self._socket_tuner = SocketTuner(socket_buf=self.config.socket_buf)
-        self._receiver = FileReceiver(chunk_size=self.config.chunk_size, idle_timeout=self.config.file_idle_timeout)
+        self._host_key = self._load_or_create_host_key()
 
-    async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        peer = writer.get_extra_info("peername")
-        sock = writer.get_extra_info("socket")
-        if isinstance(sock, socket.socket):
-            try:
-                self._socket_tuner.tune(sock)
-            except Exception:
-                # Опции могут быть недоступны на некоторых платформах/обертках
-                pass
-
+    def _load_or_create_host_key(self) -> "paramiko.PKey":
+        path = self.config.host_key_path
         try:
-            self.logger.info(f"Подключен клиент: {peer}")
+            if os.path.exists(path):
+                return paramiko.RSAKey.from_private_key_file(path)
 
-            client_name = await ProtocolV2.read_string(reader)
-            self.logger.info(f"Имя клиента: {client_name}")
-
-            file_size = await ProtocolV2.read_u64(reader)
-            filename = await ProtocolV2.read_string(reader)
-            upload_id = await ProtocolV2.read_string(reader)
-
-            session = UploadSession.from_header(
-                images_dir=self.config.images_dir,
-                client_name=client_name,
-                filename=filename,
-                upload_id=upload_id,
-                file_size=file_size,
-            )
-
-            self.logger.info(
-                f"Клиент {client_name} ({peer}) отправляет файл: {session.filename}, "
-                f"size={session.file_size}, upload_id={session.upload_id}"
-            )
-
-            lock = self._uploads.lock_for(session.upload_id)
-            async with lock:
-                os.makedirs(session.client_dir, exist_ok=True)
-
-                # Определяем сколько уже получено
-                existing = self._uploads.existing_offset(session)
-
-                # Если на диске больше, чем ожидается — сбрасываем (файл поменялся или upload_id ошибочный)
-                if existing > session.file_size:
-                    self._uploads.reset_part(session)
-                    existing = 0
-
-                # Сообщаем клиенту оффсет, с которого продолжать
-                self.logger.info(f"Resume: upload_id={session.upload_id} offset={existing}/{session.file_size}")
-                ProtocolV2.write_u64(writer, existing)
-                await writer.drain()
-
-                remaining = session.file_size - existing
-                if remaining > 0:
-                    # Дописываем с конца
-                    with open(
-                        session.part_path,
-                        "r+b" if os.path.exists(session.part_path) else "wb",
-                        buffering=self.config.file_buffering,
-                    ) as f:
-                        f.seek(existing)
-                        await self._receiver.receive_exactly_to_file(reader, f, remaining)
-
-                # Завершено: если ещё не помечено как done — финализируем.
-                # Важно: используем done-маркер, чтобы повторное подключение после обрыва
-                # (когда клиент не получил OK) не приводило к повторной загрузке.
-                if not os.path.exists(session.done_path):
-                    final_path = self._uploads.finalize(session)
-                else:
-                    final_path = self._uploads.read_final_path(session) or "unknown"
-
-            self.logger.info(f"Файл сохранён: {final_path} ({session.file_size} байт)")
-
-            writer.write(b"OK")
-            await writer.drain()
-        except (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError, ConnectionError) as e:
-            self.logger.error(f"Ошибка соединения с клиентом {peer}: {e}")
-            try:
-                writer.write(b"ER")
-                await writer.drain()
-            except Exception:
-                pass
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            key = paramiko.RSAKey.generate(bits=self.config.host_key_bits)
+            key.write_private_key_file(path)
+            os.chmod(path, 0o600)
+            self.logger.info(f"Создан новый host key: {path}")
+            return key
         except Exception as e:
-            self.logger.error(f"Ошибка при работе с клиентом {peer}: {e}")
+            raise RuntimeError(f"Не удалось загрузить/создать host key ({path}): {e}") from e
+
+    def _handle_connection(self, client_sock: socket.socket, addr) -> None:
+        transport: Optional["paramiko.Transport"] = None
+        try:
+            self.logger.info(f"Обработка SSH-сессии: {addr}")
             try:
-                writer.write(b"ER")
-                await writer.drain()
+                self._socket_tuner.tune(client_sock)
             except Exception:
                 pass
+            try:
+                client_sock.settimeout(15.0)
+            except Exception:
+                pass
+
+            transport = paramiko.Transport(client_sock)
+            # Ограничиваем ожидание баннера/аутентификации (иначе зависшие клиенты держат поток)
+            transport.banner_timeout = 15.0
+            transport.auth_timeout = 15.0
+            self.logger.debug(f"SSH transport создан: {addr}")
+            transport.add_server_key(self._host_key)
+
+            server = SSHAuthServer(self.config.username, self.config.password, logger=self.logger)
+            try:
+                self.logger.debug(f"Запуск SSH negotiation: {addr}")
+                transport.start_server(server=server)
+            except paramiko.SSHException as e:
+                self.logger.error(f"SSH negotiation failed from {addr}: {e}")
+                return
+
+            # В server-mode каналы обычно нужно явно accept-ить,
+            # иначе клиент может зависнуть на открытии session/subsystem.
+            self.logger.debug(f"Ожидание SSH channel: {addr}")
+            chan = transport.accept(20)
+            if chan is None:
+                self.logger.warning(f"SSH channel not opened by {addr} (timeout)")
+                return
+            self.logger.debug(f"SSH channel открыт: {addr}, channel={chan.get_id()}")
+
+            # Ждём запрос подсистемы SFTP и запускаем обработчик вручную.
+            if not server._sftp_requested.wait(15.0):
+                self.logger.warning(f"SFTP subsystem not requested by {addr} (timeout)")
+                return
+
+            self.logger.debug(f"Запуск SFTP подсистемы: {addr}")
+            sftp = paramiko.SFTPServer(
+                chan,
+                "sftp",
+                server,
+                SimpleSFTPServer,
+                root=self.config.images_dir,
+                logger=self.logger,
+            )
+            # Блокирует поток до закрытия канала/сессии
+            sftp.start_subsystem("sftp", transport, chan)
+        except Exception as e:
+            self.logger.error(f"Ошибка SFTP-сессии от {addr}: {e}")
         finally:
             try:
-                writer.close()
-                await writer.wait_closed()
+                if transport is not None:
+                    transport.close()
             except Exception:
                 pass
+            try:
+                client_sock.close()
+            except Exception:
+                pass
+
+    def _serve_forever(self) -> None:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, self.config.socket_buf)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, self.config.socket_buf)
+        except Exception:
+            pass
+
+        sock.bind((self.config.ip, self.config.port))
+        sock.listen(socket.SOMAXCONN)
+        self.logger.info(f"SFTP сервер запущен на {(self.config.ip, self.config.port)}")
+        self.logger.info(f"SFTP root: {self.config.images_dir}")
+        self.logger.info(f"Auth: username={self.config.username!r} (password задан в конфиге)")
+
+        while True:
+            client, addr = sock.accept()
+            self.logger.info(f"Подключение: {addr}")
+            t = threading.Thread(target=self._handle_connection, args=(client, addr), daemon=True)
+            t.start()
 
     async def start(self) -> None:
-        server = await asyncio.start_server(
-            self.handle_client,
-            host=self.config.ip,
-            port=self.config.port,
-            backlog=socket.SOMAXCONN,
-            limit=max(self.config.stream_limit, self.config.chunk_size * 2),
-        )
-
-        # Настраиваем listening socket (recvbuf)
-        for s in server.sockets or []:
-            try:
-                s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, self.config.socket_buf)
-                s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, self.config.socket_buf)
-            except Exception:
-                pass
-
-        addrs = ", ".join(str(s.getsockname()) for s in (server.sockets or []))
-        self.logger.info(f"Сервер запущен на {addrs}")
-        self.logger.info("Ожидание подключений...")
-
-        async with server:
-            await server.serve_forever()
+        await asyncio.to_thread(self._serve_forever)
 
 
 if __name__ == "__main__":

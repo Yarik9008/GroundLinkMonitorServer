@@ -38,3 +38,6 @@ Thumbs.db
 
 # Received images
 received_images/
+
+# SSH host key generated at runtime
+ssh_host_rsa_key
