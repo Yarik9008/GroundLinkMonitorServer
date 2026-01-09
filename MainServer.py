@@ -141,6 +141,7 @@ UsePAM no
 UseDNS no
 PrintMotd no
 PermitRootLogin no
+PubkeyAuthentication yes
 PasswordAuthentication yes
 KbdInteractiveAuthentication no
 ChallengeResponseAuthentication no
