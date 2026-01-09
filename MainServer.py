@@ -197,19 +197,20 @@ def handle_client(client_sock, host_key):
     server = SimpleServer()
 
     try:
+        # CRITICAL: Register SFTP subsystem handler BEFORE start_server
+        # so it's ready when client requests "sftp" subsystem
+        transport.set_subsystem_handler(
+            "sftp",
+            paramiko.SFTPServer,
+            sftp_si=SimpleSFTPServer,
+        )
+
         transport.start_server(server=server)
 
         chan = transport.accept(20)
         if chan is None:
             print("[server] No channel, closing")
             return
-
-        # Start SFTP subsystem
-        transport.set_subsystem_handler(
-            "sftp",
-            paramiko.SFTPServer,
-            SimpleSFTPServer,
-        )
 
         # Keep connection alive until transport ends
         while transport.is_active():
