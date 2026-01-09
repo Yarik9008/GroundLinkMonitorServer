@@ -148,10 +148,21 @@ class _ProgressFile:
                 print(f"[server] progress {self._path}: {format_bytes(self._written)}")
         return res
 
-    async def close(self):
+    def close(self):
+        """Close file.
+
+        asyncssh expects a synchronous close() (it calls file_obj.close()).
+        If the underlying close() is awaitable, schedule it in the background.
+        """
         res = self._inner.close()
         if inspect.isawaitable(res):
-            res = await res
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(res)
+            except RuntimeError:
+                # No running loop; best effort: ignore to avoid RuntimeWarning
+                pass
+            return None
         return res
 
 
