@@ -9,7 +9,7 @@ import os
 import logging
 import smtplib
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import urljoin, quote
 from collections import defaultdict
 from colorama import init, Fore, Style
 from datetime import datetime, timedelta, timezone
@@ -923,9 +923,13 @@ def build_stats_email_body(
                 html_lines.append(f"        <strong>Пустые пролеты ({len(unsuccessful_filenames)})</strong>")
                 html_lines.append(f"        <ul>")
                 for filename in unsuccessful_filenames:
-                    # Экранируем HTML специальные символы в имени файла
-                    filename_escaped = filename.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-                    html_lines.append(f"          <li>{filename_escaped}</li>")
+                    # Вместо имени файла показываем ссылку на просмотр лога (график)
+                    log_url = f"https://eus.lorett.org/eus/log_view/{quote(str(filename))}"
+                    # Экранируем HTML специальные символы
+                    log_url_escaped = log_url.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                    html_lines.append(
+                        f"          <li><a href='{log_url_escaped}' target='_blank' rel='noopener noreferrer'>{log_url_escaped}</a></li>"
+                    )
                 html_lines.append(f"        </ul>")
                 html_lines.append(f"      </div>")
             
