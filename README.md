@@ -16,33 +16,49 @@ pip install -r requirements.txt
 ```
 
 ## Использование
+
+Текущая дата (UTC):
 ```bash
-# текущая дата (UTC)
 python3 LorettGroundLinkMonitor.py
+```
 
-# конкретная дата
+Конкретная дата:
+```bash
 python3 LorettGroundLinkMonitor.py 20260107
+```
 
-# диапазон дат
+Диапазон дат:
+```bash
 python3 LorettGroundLinkMonitor.py 20260101 20260107
+```
 
-# ежедневный запуск
+Ежедневный запуск:
+```bash
 python3 LorettGroundLinkMonitor.py --scheduler
+```
 
-# статистика по коммерческим спутникам (список берётся из commercial_satellites в config.json)
-# только станция (дата по умолчанию = сегодня)
+Статистика по коммерческим спутникам (список берётся из commercial_satellites в config.json), только станция:
+```bash
 python3 LorettGroundLinkMonitor.py --stat-commers R2.0S_Moscow
+```
 
-# станция + начало
+Статистика по коммерческим спутникам, станция + начало:
+```bash
 python3 LorettGroundLinkMonitor.py --stat-commers R2.0S_Moscow 20260101
+```
 
-# станция + начало + конец
+Статистика по коммерческим спутникам, станция + начало + конец:
+```bash
 python3 LorettGroundLinkMonitor.py --stat-commers R2.0S_Moscow 20260101 20260110
+```
 
-# статистика по всем пролётам
+Статистика по всем пролётам:
+```bash
 python3 LorettGroundLinkMonitor.py --stat-all R2.0S_Moscow 20260101 20260110
+```
 
-# отключить отправку email (для ручных запусков)
+Отключить отправку email (для ручных запусков):
+```bash
 python3 LorettGroundLinkMonitor.py --off-email 20260110
 ```
 
@@ -55,17 +71,23 @@ python3 LorettGroundLinkMonitor.py --off-email 20260110
 ## Systemd (сервис мониторинга)
 Если скрипт установлен как systemd-сервис `lorett-monitor.service`, используйте:
 
+Старт:
 ```bash
-# старт
 sudo systemctl start lorett-monitor.service
+```
 
-# остановка
+Остановка:
+```bash
 sudo systemctl stop lorett-monitor.service
+```
 
-# статус
+Статус:
+```bash
 systemctl status lorett-monitor.service --no-pager
+```
 
-# перезапуск
+Перезапуск:
+```bash
 sudo systemctl restart lorett-monitor.service
 ```
 
