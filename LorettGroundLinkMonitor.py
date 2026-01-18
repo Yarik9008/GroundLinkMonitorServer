@@ -22,6 +22,9 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.application import MIMEApplication
 from email.mime.image import MIMEImage
 
+# --- test_1.py-style HTML parsing (stations as columns + direct log_get links) ---
+from urllib.parse import urlparse
+
 # Импортируем Logger
 try:
     from Logger import Logger
@@ -60,6 +63,8 @@ logging.basicConfig(
     force=True  # Перезаписываем предыдущую конфигурацию
 )
 logger = logging.getLogger(__name__)
+EMAIL_DISABLED = False
+
 
 # === Константы (загружаются из config.json с fallback на значения по умолчанию) ===
 # Значения по умолчанию используются если конфиг не найден или параметры отсутствуют
@@ -72,7 +77,6 @@ _DEFAULT_CONSTANTS = {
     'max_concurrent_downloads': 10,
     'graph_viewport_width': 620,
     'graph_viewport_height': 680,
-    'graph_display_width': 500,
     'graph_load_delay': 0.5,
     'graph_scroll_x': 0,
     'graph_scroll_y': 0
@@ -134,6 +138,24 @@ def _load_constants() -> Dict[str, Any]:
         logger.error(f"Неожиданная ошибка при загрузке констант: {e}", exc_info=True)
     return _DEFAULT_CONSTANTS.copy()
 
+
+def _load_commercial_satellites() -> List[str]:
+    """Загружает список коммерческих спутников из config.json (fallback на дефолт)."""
+    default = ["TY", "2025-108B", "2024-110A", "TEE-04A", "TEE-01B", "JILIN-1_GAOFEN_4A"]
+    try:
+        config_path = Path("/root/lorett/GroundLinkMonitorServer/config.json")
+        if not config_path.exists():
+            return default
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+        satellites = config.get("commercial_satellites", default)
+        if not isinstance(satellites, list):
+            return default
+        cleaned = [str(s).strip() for s in satellites if str(s).strip()]
+        return cleaned or default
+    except Exception:
+        return default
+
 # Инициализируем константы при импорте модуля
 _CONSTANTS = _load_constants()
 
@@ -146,7 +168,6 @@ REQUEST_TIMEOUT = _CONSTANTS['request_timeout']
 MAX_CONCURRENT_DOWNLOADS = _CONSTANTS['max_concurrent_downloads']
 GRAPH_VIEWPORT_WIDTH = _CONSTANTS['graph_viewport_width']
 GRAPH_VIEWPORT_HEIGHT = _CONSTANTS['graph_viewport_height']
-GRAPH_DISPLAY_WIDTH = _CONSTANTS['graph_display_width']
 GRAPH_LOAD_DELAY = _CONSTANTS['graph_load_delay']
 GRAPH_SCROLL_X = _CONSTANTS['graph_scroll_x']
 GRAPH_SCROLL_Y = _CONSTANTS['graph_scroll_y']
@@ -166,31 +187,6 @@ def create_unverified_ssl_context():
     ssl_context.check_hostname = False
     ssl_context.verify_mode = ssl.CERT_NONE
     return ssl_context
-
-
-# Строит URL для получения списка логов по типу станции (oper/reg/frames)
-def build_logs_url(station_type: str, base_urls: Dict[str, str], 
-                   date_before: str, date_after: str) -> str:
-    """
-    Строит URL для получения списка логов в зависимости от типа станции.
-    
-    Args:
-        station_type: Тип станции ('oper', 'reg', 'frames')
-        base_urls: Словарь базовых URL для типов станций
-        date_before: Начальная дата в формате YYYY-MM-DD
-        date_after: Конечная дата в формате YYYY-MM-DD
-        
-    Returns:
-        str: Полный URL для получения списка логов
-    """
-    base_url = base_urls.get(station_type, base_urls.get('reg', 'http://eus.lorett.org/eus'))
-    
-    if station_type == 'reg':
-        return f"{base_url}/logs_list.html?t0={date_before}&t1={date_after}"
-    elif station_type == 'frames':
-        return f"{base_url}/loglist_frames.html?t0={date_before}&t1={date_after}"
-    else:  # oper
-        return f"{base_url}/logs.html?group=*&stid=*&satlist=*&t0={date_before}&t1={date_after}"
 
 
 # Возвращает пути для даты: year, month, date_str, date_display
@@ -1153,18 +1149,25 @@ def is_log_file_downloaded(file_path: Path) -> bool:
 
 
 # Загружает конфигурацию из config.json и возвращает станции, URL и заголовки
-def load_config() -> Tuple[Dict[str, str], List[str], List[str], List[str], Dict[str, str], Dict[str, str]]:
+def load_config() -> Tuple[
+    Dict[str, str],          # canonical station -> type (kept for compatibility)
+    List[str],               # station identifiers to search on pages (canonical + aliases)
+    Dict[str, str],          # base_urls
+    Dict[str, str],          # headers
+    Dict[str, str],          # alias_to_canonical
+]:
     """
     Загружает конфигурацию из файла config.json.
     
     Returns:
         Tuple содержащий:
-        - Словарь {имя_станции: тип_станции}
-        - Список оперативных станций
-        - Список регулярных станций
-        - Список frames станций
+        - Словарь {каноническое_имя_станции: тип_станции}
+        - Список имён станций для поиска на странице oper (включая aliases)
+        - Список имён станций для поиска на странице reg (включая aliases)
+        - Список имён станций для поиска на странице frames (включая aliases)
         - Словарь базовых URL для типов станций
         - Словарь HTTP заголовков
+        - Словарь алиасов: {alias: canonical_name}
         
     Raises:
         FileNotFoundError: Если файл config.json не найден
@@ -1185,7 +1188,32 @@ def load_config() -> Tuple[Dict[str, str], List[str], List[str], List[str], Dict
         raise RuntimeError(f"Ошибка чтения файла конфигурации: {e}")
     
     try:
-        stations = {s['name']: s['type'] for s in config['stations']}
+        # Типы станций (oper/reg) больше не используются для загрузки (мы парсим обе страницы).
+        # Сохраняем словарь как "известные станции" по имени.
+        stations = {s["name"]: "station" for s in config["stations"]}
+
+        # Поддержка "aliases" для исторических имен станций в логах + auto-alias:
+        # auto-alias = часть до первого "_" (например R3.2S_Murmansk -> R3.2S).
+        alias_to_canonical: Dict[str, str] = {}
+        for s in config["stations"]:
+            canonical = s["name"]
+            alias_to_canonical[canonical] = canonical
+
+            # explicit aliases
+            aliases = s.get("aliases") or s.get("alias") or []
+            if isinstance(aliases, str):
+                aliases = [aliases]
+            if isinstance(aliases, (list, tuple, set)):
+                for a in aliases:
+                    a = str(a).strip()
+                    if not a:
+                        continue
+                    alias_to_canonical[a] = canonical
+
+            # auto-alias
+            auto = str(canonical).split("_", 1)[0].strip()
+            if auto and auto not in alias_to_canonical:
+                alias_to_canonical[auto] = canonical
         base_urls = config.get('base_urls', {
             'oper': "https://eus.lorett.org/eus",
             'reg': "http://eus.lorett.org/eus",
@@ -1195,11 +1223,8 @@ def load_config() -> Tuple[Dict[str, str], List[str], List[str], List[str], Dict
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         })
         
-        oper_stations = [n for n, t in stations.items() if t == 'oper']
-        reg_stations = [n for n, t in stations.items() if t == 'reg']
-        frames_stations = [n for n, t in stations.items() if t == 'frames']
-        
-        return stations, oper_stations, reg_stations, frames_stations, base_urls, headers
+        station_identifiers = sorted(set(alias_to_canonical.keys()))
+        return stations, station_identifiers, base_urls, headers, alias_to_canonical
     except KeyError as e:
         raise ValueError(f"Отсутствует обязательное поле в конфигурации: {e}")
     except Exception as e:
@@ -1207,7 +1232,13 @@ def load_config() -> Tuple[Dict[str, str], List[str], List[str], List[str], Dict
 
 
 # Синхронно загружает HTML страницу со списком логов для типа станций
-def fetch_logs_page(url: str, st: str, headers: Dict[str, str], max_retries: int = 3) -> str:
+def fetch_logs_page(
+    url: str,
+    st: str,
+    headers: Dict[str, str],
+    params: Optional[Dict[str, str]] = None,
+    max_retries: int = 3,
+) -> str:
     """
     Загружает HTML страницу со списком логов для указанного типа станций.
     Автоматически повторяет запрос при ошибке 503 (Service Unavailable).
@@ -1228,7 +1259,7 @@ def fetch_logs_page(url: str, st: str, headers: Dict[str, str], max_retries: int
     
     for attempt in range(1, max_retries + 1):
         try:
-            r = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT, verify=False)
+            r = requests.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT, verify=False)
             r.raise_for_status()
             return r.text
         except requests.HTTPError as e:
@@ -1255,43 +1286,65 @@ def fetch_logs_page(url: str, st: str, headers: Dict[str, str], max_retries: int
     raise requests.RequestException(f"Не удалось загрузить страницу для '{st}' после {max_retries} попыток")
 
 
-# Парсит HTML и находит все логи для указанной даты, группируя по станциям
-def find_logs_in_page(html: str, date: str, names: List[str], source_base_url: str) -> Dict[str, List[Tuple[str, str]]]:
+# --- test_1.py-style parsing: station columns + direct log_get links ---
+_STATION_RE = re.compile(r"logstation\.html\?stid=([^&\"']+)", re.I)
+_DATE_ROW_RE = re.compile(
+    r"<tr>\s*<td[^>]*>\s*<b>\s*(\d{4}-\d{2}-\d{2})\s*</b>\s*</td>(.*?)</tr>",
+    re.I | re.S,
+)
+_TD_RE = re.compile(r"<td[^>]*>(.*?)</td>", re.I | re.S)
+_PASS_RE = re.compile(
+    r"href=['\"](log_view/[^'\"]+)['\"].*?"
+    r"href=['\"](log_get/[^'\"]+)['\"]",
+    re.I | re.S,
+)
+
+
+def _parse_log_get_links_for_date(
+    *,
+    html: str,
+    page_url: str,
+    date_iso: str,
+    station_allowlist: Optional[set] = None,
+    alias_to_canonical: Optional[Dict[str, str]] = None,
+) -> Dict[str, List[str]]:
     """
-    Находит все логи для указанной даты на странице HTML.
-    
-    Args:
-        html: HTML содержимое страницы со списком логов
-        date: Дата в формате YYYYMMDD
-        names: Список имен станций для фильтрации
-        source_base_url: Базовый URL страницы, на которой были найдены логи
-        
-    Returns:
-        Dict[str, List[Tuple[str, str]]]: Словарь {имя_станции: [(имя_файла, base_url), ...]}
+    Возвращает {canonical_station: [log_get_url, ...]} за конкретную дату (YYYY-MM-DD),
+    используя таблицу на странице как в GroundLinkMonitorServer/test/test_1.py.
     """
-    log_urls = set(re.findall(rf'log_view/([^"\s<>]+__{date}[^"\s<>]+_rec\.log)', html))
-    for link in BeautifulSoup(html, 'html.parser').find_all('a', href=True):
-        h = link.get('href', '')
-        if date in h and '_rec.log' in h:
-            m = re.search(rf'([^/]+__{date}[^"\s<>]+_rec\.log)', h)
-            if m:
-                log_urls.add(m.group(1))
-    logs_by_station = defaultdict(list)
-    station_set = set(names)
-    for log_url in sorted(log_urls):
-        m = re.match(rf'^([^_]+(?:_[^_]+)*)__{date}', log_url)
-        if m and m.group(1) in station_set:
-            # Сохраняем имя файла вместе с base_url источника
-            logs_by_station[m.group(1)].append((log_url, source_base_url))
-    return logs_by_station
+    # станции на странице = порядок колонок
+    local: List[str] = []
+    for m in _STATION_RE.finditer(html):
+        st = m.group(1)
+        if st not in local:
+            local.append(st)
+
+    allow = station_allowlist
+    out: Dict[str, set] = defaultdict(set)  # canonical -> set(url)
+
+    for row in _DATE_ROW_RE.finditer(html):
+        if row.group(1) != date_iso:
+            continue
+        cells = _TD_RE.findall(row.group(2))
+        for i, cell in enumerate(cells):
+            if i >= len(local):
+                break
+            station_id = local[i]
+            if allow is not None and station_id not in allow:
+                continue
+            canonical = alias_to_canonical.get(station_id, station_id) if alias_to_canonical else station_id
+            for p in _PASS_RE.finditer(cell):
+                get_url = urljoin(page_url, p.group(2))
+                out[canonical].add(get_url)
+
+    return {k: sorted(v) for k, v in out.items()}
 
 
 # Асинхронно скачивает один лог-файл с валидацией и ограничением параллелизма через семафор
 async def download_single_log_async(
     session: 'aiohttp.ClientSession',
-    log_file: str,
+    log_get_url: str,
     file_path: Path,
-    base_url: str,
     headers: Dict[str, str],
     semaphore: asyncio.Semaphore,
     max_retries: int = 2
@@ -1301,9 +1354,8 @@ async def download_single_log_async(
     
     Args:
         session: aiohttp клиентская сессия
-        log_file: Имя файла лога для скачивания
+        log_get_url: Полный URL для скачивания (log_get/...)
         file_path: Путь для сохранения файла
-        base_url: Базовый URL для запроса
         headers: HTTP заголовки
         semaphore: Семафор для ограничения количества одновременных запросов
         max_retries: Максимальное количество попыток загрузки
@@ -1317,7 +1369,7 @@ async def download_single_log_async(
         for attempt in range(1, max_retries + 1):
             try:
                 ssl_context = create_unverified_ssl_context()
-                url = urljoin(base_url, f"/eus/log_get/{log_file}")
+                url = log_get_url
                 timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
                 
                 async with session.get(url, headers=headers, timeout=timeout, ssl=ssl_context) as response:
@@ -1360,7 +1412,7 @@ async def download_single_log_async(
                     else:
                         last_error = "Файл не прошел проверку после загрузки"
                         if attempt < max_retries:
-                            logger.warning(f"Попытка {attempt}/{max_retries} загрузки {log_file} не удалась: {last_error}")
+                            logger.warning(f"Попытка {attempt}/{max_retries} загрузки {file_path.name} не удалась: {last_error}")
                             await asyncio.sleep(1)
                             continue
                         return False, last_error, 0
@@ -1368,7 +1420,7 @@ async def download_single_log_async(
             except asyncio.TimeoutError:
                 last_error = "Таймаут запроса"
                 if attempt < max_retries:
-                    logger.warning(f"Попытка {attempt}/{max_retries} загрузки {log_file}: {last_error}")
+                    logger.warning(f"Попытка {attempt}/{max_retries} загрузки {file_path.name}: {last_error}")
                     await asyncio.sleep(1)
                     continue
                 return False, last_error, 0
@@ -1377,7 +1429,7 @@ async def download_single_log_async(
                 if e.status == 503:
                     delay = 2 ** attempt  # Экспоненциальная задержка: 2, 4, 8 секунд
                     last_error = f"Ошибка 503 (Service Unavailable)"
-                    logger.warning(f"Попытка {attempt}/{max_retries} загрузки {log_file}: {last_error}. Повтор через {delay} сек...")
+                    logger.warning(f"Попытка {attempt}/{max_retries} загрузки {file_path.name}: {last_error}. Повтор через {delay} сек...")
                     if attempt < max_retries:
                         await asyncio.sleep(delay)
                         continue
@@ -1385,28 +1437,28 @@ async def download_single_log_async(
                 else:
                     last_error = f"Ошибка HTTP {e.status}: {e.message}"
                     if attempt < max_retries:
-                        logger.warning(f"Попытка {attempt}/{max_retries} загрузки {log_file}: {last_error}")
+                        logger.warning(f"Попытка {attempt}/{max_retries} загрузки {file_path.name}: {last_error}")
                         await asyncio.sleep(1)
                         continue
                     return False, last_error, 0
             except aiohttp.ClientError as e:
                 last_error = f"Ошибка HTTP: {e}"
                 if attempt < max_retries:
-                    logger.warning(f"Попытка {attempt}/{max_retries} загрузки {log_file}: {last_error}")
+                    logger.warning(f"Попытка {attempt}/{max_retries} загрузки {file_path.name}: {last_error}")
                     await asyncio.sleep(1)
                     continue
                 return False, last_error, 0
             except (OSError, PermissionError) as e:
                 last_error = f"Ошибка файловой системы: {e}"
                 if attempt < max_retries:
-                    logger.warning(f"Попытка {attempt}/{max_retries} загрузки {log_file}: {last_error}")
+                    logger.warning(f"Попытка {attempt}/{max_retries} загрузки {file_path.name}: {last_error}")
                     await asyncio.sleep(1)
                     continue
                 return False, last_error, 0
             except Exception as e:
                 last_error = f"Неожиданная ошибка: {e}"
                 if attempt < max_retries:
-                    logger.warning(f"Попытка {attempt}/{max_retries} загрузки {log_file}: {last_error}")
+                    logger.warning(f"Попытка {attempt}/{max_retries} загрузки {file_path.name}: {last_error}")
                     await asyncio.sleep(1)
                     continue
                 return False, last_error, 0
@@ -1416,31 +1468,32 @@ async def download_single_log_async(
 
 # Асинхронно скачивает все логи параллельно (до MAX_CONCURRENT_DOWNLOADS одновременно) с прогресс-баром
 async def download_logs_async(
-    all_logs: Dict[str, List[Tuple[str, str]]],
+    all_logs: Dict[str, List[str]],
     stations: Dict[str, str],
     base_urls: Dict[str, str],
     headers: Dict[str, str],
     logs_dir: Path
-) -> Tuple[int, int]:
+) -> Tuple[int, int, int]:
     """
     Асинхронно скачивает все логи из словаря all_logs.
     
     Args:
-        all_logs: Словарь {имя_станции: [(имя_лог_файла, base_url), ...]}
+        all_logs: Словарь {имя_станции: [log_get_url, ...]}
         stations: Словарь {имя_станции: тип_станции}
         base_urls: Словарь базовых URL для типов станций (не используется, оставлен для совместимости)
         headers: HTTP заголовки
         logs_dir: Базовая директория для сохранения логов
         
     Returns:
-        Tuple[int, int]: (количество скачанных файлов, количество ошибок)
+        Tuple[int, int, int]: (количество скачанных файлов, количество ошибок, количество логов "нет в БД")
     """
     if not AIOHTTP_AVAILABLE:
         print_error("aiohttp не установлен. Установите: pip install aiohttp", is_critical=True)
-        return 0, 0
+        return 0, 0, 0
     
     downloaded = 0
     failed = 0
+    db_missing = 0
     
     ssl_context = create_unverified_ssl_context()
     connector = aiohttp.TCPConnector(ssl=ssl_context)
@@ -1452,7 +1505,7 @@ async def download_logs_async(
     files_to_download = []
     existing_files_count = 0
     
-    for station_name, log_files_with_urls in sorted(all_logs.items()):
+    for station_name, log_get_urls in sorted(all_logs.items()):
         # Проверка существования станции в конфиге
         if station_name not in stations:
             continue
@@ -1460,8 +1513,9 @@ async def download_logs_async(
         station_dir = logs_dir / station_name
         station_dir.mkdir(exist_ok=True)
         
-        for log_file, source_base_url in sorted(log_files_with_urls):
-            file_path = station_dir / log_file
+        for log_get_url in sorted(log_get_urls):
+            filename = os.path.basename(urlparse(log_get_url).path)
+            file_path = station_dir / filename
             
             # Проверяем существующий файл
             if file_path.exists():
@@ -1475,8 +1529,7 @@ async def download_logs_async(
                     except (FileNotFoundError, PermissionError) as e:
                         logger.warning(f"Не удалось удалить невалидный файл {file_path}: {e}")
             
-            # Используем base_url источника, на котором был найден лог
-            files_to_download.append((log_file, file_path, source_base_url))
+            files_to_download.append((log_get_url, file_path))
     
     total_to_download = len(files_to_download)
     total_files = total_to_download + existing_files_count
@@ -1491,11 +1544,16 @@ async def download_logs_async(
     if total_files > 0:
         update_progress_bar(current_progress, total_files)
     
-    async def download_with_progress(session: 'aiohttp.ClientSession', log_file: str, file_path: Path, 
-                                     base_url: str, headers: Dict[str, str], semaphore: asyncio.Semaphore) -> Tuple[bool, Optional[str], int]:
+    async def download_with_progress(
+        session: 'aiohttp.ClientSession',
+        log_get_url: str,
+        file_path: Path,
+        headers: Dict[str, str],
+        semaphore: asyncio.Semaphore,
+    ) -> Tuple[bool, Optional[str], int]:
         """Обертка для обновления прогресс-бара"""
         nonlocal current_progress
-        result = await download_single_log_async(session, log_file, file_path, base_url, headers, semaphore)
+        result = await download_single_log_async(session, log_get_url, file_path, headers, semaphore)
         async with progress_lock:
             current_progress += 1
             if total_files > 0:
@@ -1507,14 +1565,14 @@ async def download_logs_async(
         if files_to_download:
             # Создаем задачи с сессией
             tasks = [
-                download_with_progress(session, log_file, file_path, base_url, headers, semaphore)
-                for log_file, file_path, base_url in files_to_download
+                download_with_progress(session, log_get_url, file_path, headers, semaphore)
+                for log_get_url, file_path in files_to_download
             ]
             
             results = await asyncio.gather(*tasks, return_exceptions=True)
             
             # Обрабатываем результаты
-            for (log_file, _, _), result in zip(files_to_download, results):
+            for (_, file_path), result in zip(files_to_download, results):
                 if isinstance(result, Exception):
                     failed += 1
                 else:
@@ -1523,6 +1581,9 @@ async def download_logs_async(
                         downloaded += 1
                     else:
                         failed += 1
+                        # Частый кейс для старых дат: ссылка есть, но EUS отвечает "No log ... in the database"
+                        if error_msg and "Ошибка базы данных:" in str(error_msg):
+                            db_missing += 1
     
     # Завершаем прогресс-бар
     if total_files > 0:
@@ -1530,7 +1591,7 @@ async def download_logs_async(
     
     downloaded += existing_files_count
     
-    return downloaded, failed
+    return downloaded, failed, db_missing
 
 
 # Главная функция загрузки: находит и скачивает все логи за указанную дату со всех станций
@@ -1542,7 +1603,7 @@ def download_logs_for_date(target_date: str) -> None:
         target_date: Дата в формате YYYYMMDD
     """
     try:
-        stations, oper_stations, reg_stations, frames_stations, base_urls, headers = load_config()
+        stations, station_identifiers, base_urls, headers, alias_to_canonical = load_config()
     except FileNotFoundError as e:
         logger.error(f"Файл config.json не найден: {e}")
         print_error(f"Ошибка загрузки config.json: {e}", is_critical=True)
@@ -1566,27 +1627,41 @@ def download_logs_for_date(target_date: str) -> None:
     # Запрашиваем диапазон ±1 день для гарантированного получения данных
     date_before = (date_obj - timedelta(days=1)).strftime("%Y-%m-%d")
     date_after = (date_obj + timedelta(days=1)).strftime("%Y-%m-%d")
-    
-    # Загружаем страницы со списком логов (синхронно)
-    all_logs = {}
-    for st, st_list in [('oper', oper_stations), ('reg', reg_stations), ('frames', frames_stations)]:
-        if not st_list:
-            continue
+    date_iso = date_obj.strftime("%Y-%m-%d")
+
+    params = {"t0": date_before, "t1": date_after}
+    allow = set(station_identifiers) if station_identifiers else None
+
+    # БЕЗ разделения на oper/reg: парсим обе страницы как в test_1.py
+    sources: List[Tuple[str, str]] = []
+    reg_base = base_urls.get("reg") or base_urls.get("oper") or "https://eus.lorett.org/eus"
+    oper_base = base_urls.get("oper") or base_urls.get("reg") or "https://eus.lorett.org/eus"
+    sources.append(("logs_list", urljoin(reg_base.rstrip("/") + "/", "logs_list.html")))
+    sources.append(("logs", urljoin(oper_base.rstrip("/") + "/", "logs.html")))
+    # frames оставляем опционально: на некоторых инсталляциях формат другой
+    frames_base = base_urls.get("frames")
+    if frames_base:
+        sources.append(("frames", urljoin(frames_base.rstrip("/") + "/", "loglist_frames.html")))
+
+    all_logs: Dict[str, List[str]] = {}
+    for label, url in sources:
         try:
-            url = build_logs_url(st, base_urls, date_before, date_after)
-            source_base_url = base_urls.get(st, base_urls.get('oper', 'https://eus.lorett.org/eus'))
-            html = fetch_logs_page(url, st, headers)
-            for station, station_logs in find_logs_in_page(html, target_date, st_list, source_base_url).items():
-                all_logs.setdefault(station, []).extend(station_logs)
+            html = fetch_logs_page(url, label, headers, params=params)
+            parsed = _parse_log_get_links_for_date(
+                html=html,
+                page_url=url,
+                date_iso=date_iso,
+                station_allowlist=allow,
+                alias_to_canonical=alias_to_canonical,
+            )
+            for station, get_urls in parsed.items():
+                all_logs.setdefault(station, []).extend(get_urls)
         except requests.RequestException as e:
-            logger.warning(f"Ошибка сети при загрузке страницы для типа '{st}': {e}")
-            print_error(f"Ошибка при загрузке страницы для типа '{st}': {e}")
-        except (ValueError, KeyError) as e:
-            logger.error(f"Ошибка данных при обработке типа '{st}': {e}")
-            print_error(f"Ошибка данных при обработке типа '{st}': {e}")
+            logger.warning(f"Ошибка сети при загрузке страницы '{label}': {e}")
+            print_error(f"Ошибка при загрузке страницы '{label}': {e}")
         except Exception as e:
-            logger.error(f"Неожиданная ошибка при обработке типа '{st}': {e}", exc_info=True)
-            print_error(f"Неожиданная ошибка при обработке типа '{st}': {e}")
+            logger.error(f"Неожиданная ошибка при обработке страницы '{label}': {e}", exc_info=True)
+            print_error(f"Неожиданная ошибка при обработке страницы '{label}': {e}")
     
     total = sum(len(logs) for logs in all_logs.values())
     logger.info(f"Найдено {total} логов на {len(all_logs)} станциях для даты {target_date}")
@@ -1613,19 +1688,19 @@ def download_logs_for_date(target_date: str) -> None:
     # Используем асинхронную загрузку, если доступен aiohttp
     if AIOHTTP_AVAILABLE:
         try:
-            downloaded, failed = asyncio.run(
+            downloaded, failed, db_missing = asyncio.run(
                 download_logs_async(all_logs, stations, base_urls, headers, logs_dir)
             )
         except RuntimeError:
             # Если event loop уже запущен, используем синхронную версию как fallback
             logger.warning("Event loop уже запущен, используется синхронная загрузка")
-            downloaded, failed = _download_logs_sync(
+            downloaded, failed, db_missing = _download_logs_sync(
                 all_logs, stations, base_urls, headers, logs_dir, total
             )
     else:
         # Если aiohttp недоступен, используем синхронную загрузку
         logger.warning("aiohttp не установлен, используется синхронная загрузка")
-        downloaded, failed = _download_logs_sync(
+        downloaded, failed, db_missing = _download_logs_sync(
             all_logs, stations, base_urls, headers, logs_dir, total
         )
     
@@ -1646,9 +1721,19 @@ def download_logs_for_date(target_date: str) -> None:
         seconds = elapsed_time % 60
         time_str = f"{hours} ч {minutes} мин {seconds:.2f} сек"
     
-    logger.info(f"Загрузка завершена: скачано {downloaded}, ошибок {failed}, всего {total}, время {time_str}")
+    if db_missing > 0:
+        logger.info(
+            f"Загрузка завершена: скачано {downloaded}, ошибок {failed} (нет в БД: {db_missing}), всего {total}, время {time_str}"
+        )
+    else:
+        logger.info(f"Загрузка завершена: скачано {downloaded}, ошибок {failed}, всего {total}, время {time_str}")
     print(f"{Fore.CYAN + Style.BRIGHT}\nРЕЗУЛЬТАТЫ")
-    print(f"{Fore.GREEN if failed == 0 else Fore.RED}Скачано: {downloaded}, Ошибок: {failed}, Всего: {total}")
+    if db_missing > 0:
+        print(
+            f"{Fore.GREEN if failed == 0 else Fore.RED}Скачано: {downloaded}, Ошибок: {failed} (нет в БД: {db_missing}), Всего: {total}"
+        )
+    else:
+        print(f"{Fore.GREEN if failed == 0 else Fore.RED}Скачано: {downloaded}, Ошибок: {failed}, Всего: {total}")
     print(f"{Fore.CYAN}Время загрузки: {time_str}")
     
     # Вычисляем среднюю скорость загрузки
@@ -1660,18 +1745,18 @@ def download_logs_for_date(target_date: str) -> None:
 
 # Синхронная загрузка логов последовательно (fallback если aiohttp недоступен)
 def _download_logs_sync(
-    all_logs: Dict[str, List[Tuple[str, str]]],
+    all_logs: Dict[str, List[str]],
     stations: Dict[str, str],
     base_urls: Dict[str, str],
     headers: Dict[str, str],
     logs_dir: Path,
     total: int
-) -> Tuple[int, int]:
+) -> Tuple[int, int, int]:
     """
     Синхронная загрузка логов.
     
     Args:
-        all_logs: Словарь {имя_станции: [(имя_лог_файла, base_url), ...]}
+        all_logs: Словарь {имя_станции: [log_get_url, ...]}
         stations: Словарь {имя_станции: тип_станции}
         base_urls: Словарь базовых URL для типов станций (не используется, оставлен для совместимости)
         headers: HTTP заголовки
@@ -1679,15 +1764,16 @@ def _download_logs_sync(
         total: Общее количество логов
         
     Returns:
-        Tuple[int, int]: (количество скачанных файлов, количество ошибок)
+        Tuple[int, int, int]: (количество скачанных файлов, количество ошибок, количество логов "нет в БД")
     """
     downloaded = failed = 0
+    db_missing = 0
     
     # Подготавливаем список всех файлов для загрузки
     all_files_to_download = []
     existing_files_count = 0
     
-    for station_name, log_files_with_urls in sorted(all_logs.items()):
+    for station_name, log_get_urls in sorted(all_logs.items()):
         # Проверка существования станции в конфиге
         if station_name not in stations:
             continue
@@ -1695,8 +1781,9 @@ def _download_logs_sync(
         station_dir = logs_dir / station_name
         station_dir.mkdir(exist_ok=True)
         
-        for log_file, source_base_url in sorted(log_files_with_urls):
-            file_path = station_dir / log_file
+        for log_get_url in sorted(log_get_urls):
+            filename = os.path.basename(urlparse(log_get_url).path)
+            file_path = station_dir / filename
             if file_path.exists():
                 # Проверяем содержимое существующего файла
                 if is_valid_log_file(file_path):
@@ -1706,8 +1793,7 @@ def _download_logs_sync(
                     # Файл содержит ошибку - удаляем его
                     file_path.unlink()
             
-            # Используем base_url источника, на котором был найден лог
-            all_files_to_download.append((log_file, file_path, source_base_url))
+            all_files_to_download.append((log_get_url, file_path))
     
     total_to_download = len(all_files_to_download)
     total_files = total_to_download + existing_files_count
@@ -1723,15 +1809,14 @@ def _download_logs_sync(
     
     # Загружаем файлы с повторными попытками
     max_retries = 2
-    for log_file, file_path, base_url in all_files_to_download:
-        print(f"{Fore.CYAN}Загрузка: {log_file}")
+    for log_get_url, file_path in all_files_to_download:
+        print(f"{Fore.CYAN}Загрузка: {file_path.name}")
         success = False
         last_error = None
         
         for attempt in range(1, max_retries + 1):
             try:
-                r = requests.get(urljoin(base_url, f"/eus/log_get/{log_file}"), 
-                                headers=headers, timeout=REQUEST_TIMEOUT, verify=False)
+                r = requests.get(log_get_url, headers=headers, timeout=REQUEST_TIMEOUT, verify=False)
                 r.raise_for_status()
                 
                 # Сохраняем содержимое во временный файл для проверки
@@ -1785,7 +1870,7 @@ def _download_logs_sync(
                     delay = 2 ** attempt  # Экспоненциальная задержка: 2, 4, 8 секунд
                     last_error = f"Ошибка 503 (Service Unavailable)"
                     print(f"{Fore.YELLOW}  Попытка {attempt}/{max_retries} не удалась: {last_error}. Повтор через {delay} сек...")
-                    logger.warning(f"Ошибка 503 при загрузке {log_file}, попытка {attempt}/{max_retries}")
+                    logger.warning(f"Ошибка 503 при загрузке {file_path.name}, попытка {attempt}/{max_retries}")
                     if attempt < max_retries:
                         time.sleep(delay)
                         continue
@@ -1823,8 +1908,10 @@ def _download_logs_sync(
         if not success:
             failed += 1
             if last_error:
+                if str(last_error).startswith("Ошибка базы данных:"):
+                    db_missing += 1
                 print(f"{Fore.RED}  ✗ Не удалось загрузить после {max_retries} попыток: {last_error}")
-                logger.error(f"Не удалось загрузить {log_file} после {max_retries} попыток: {last_error}")
+                logger.error(f"Не удалось загрузить {file_path.name} после {max_retries} попыток: {last_error}")
         
         # Обновляем прогресс-бар
         current_progress += 1
@@ -1837,7 +1924,7 @@ def _download_logs_sync(
     
     downloaded += existing_files_count
     
-    return downloaded, failed
+    return downloaded, failed, db_missing
 
 
 # Определяет тип диапазона (L или X) по количеству столбцов в заголовке лог-файла
@@ -1998,6 +2085,103 @@ def calculate_avg_snr_for_station(station_folder: Path, bend_type: Optional[str]
     
     return results
 
+
+# Анализирует логи выбранных спутников по станции за диапазон дат
+def analyze_satellite_logs_for_station(
+    station_name: str,
+    start_date: datetime,
+    end_date: datetime,
+    satellites: Optional[List[str]] = None,
+) -> None:
+    """
+    Анализирует все логи станции за период и фильтрует только по указанным спутникам.
+    Сат эл. определяется по вхождению строки в имя файла.
+    """
+    stations, station_bend_map = load_stations_from_config_for_analysis()
+    bend_type = station_bend_map.get(station_name)
+    bend_type_upper = (bend_type or "L").upper()
+    threshold = X_BEND_FAILURE_THRESHOLD if bend_type_upper == "X" else L_BEND_FAILURE_THRESHOLD
+
+    sat_tokens = [s.upper() for s in satellites] if satellites else []
+
+    current_date = start_date
+    total_files = 0
+    successful = 0
+    unsuccessful = 0
+    total_measurements = 0
+    total_snr_sum = 0.0
+
+    if satellites:
+        print(f"{Fore.CYAN + Style.BRIGHT}\nАНАЛИЗ ПО СПУТНИКАМ (станция: {station_name})")
+        print(f"{Fore.CYAN}Спутники: {', '.join(satellites)}")
+    else:
+        print(f"{Fore.CYAN + Style.BRIGHT}\nАНАЛИЗ ПО ВСЕМ ПРОЛЕТАМ (станция: {station_name})")
+    print(f"{Fore.CYAN}Период: {start_date.strftime('%Y%m%d')} — {end_date.strftime('%Y%m%d')}")
+
+    while current_date <= end_date:
+        date_str = current_date.strftime("%Y%m%d")
+        year, month, _, _ = get_date_paths(date_str)
+        base_logs_dir = Path("/root/lorett/GroundLinkMonitorServer/logs") / year / month / date_str / station_name
+
+        if not base_logs_dir.exists():
+            print(f"{Fore.YELLOW}  {date_str}: папка не найдена, пропуск")
+            current_date += timedelta(days=1)
+            continue
+
+        log_files = sorted(base_logs_dir.glob("*.log"))
+        if not log_files:
+            print(f"{Fore.YELLOW}  {date_str}: лог-файлы не найдены")
+            current_date += timedelta(days=1)
+            continue
+
+        date_count = 0
+        date_success = 0
+        date_fail = 0
+        date_snr_sum = 0.0
+        date_measurements = 0
+        date_files: List[Tuple[str, bool]] = []
+
+        for log_file in log_files:
+            name_upper = log_file.name.upper()
+            if sat_tokens and not any(tok in name_upper for tok in sat_tokens):
+                continue
+            snr_sum, count = extract_snr_from_log(log_file, bend_type)
+            avg_snr = snr_sum / count if count > 0 else 0.0
+
+            date_count += 1
+            date_files.append((log_file.name, avg_snr > threshold))
+            date_measurements += count
+            date_snr_sum += snr_sum
+            if avg_snr > threshold:
+                date_success += 1
+            else:
+                date_fail += 1
+
+        if date_count > 0:
+            avg_snr_date = (date_snr_sum / date_measurements) if date_measurements > 0 else 0.0
+            print(
+                f"{Fore.BLUE}  {date_str}: файлов {date_count}, успешных {date_success}, "
+                f"пустых {date_fail}, средний SNR {avg_snr_date:.2f}"
+            )
+            print(f"{Fore.CYAN}    Пролеты:")
+            for fname, is_success in sorted(date_files):
+                color = Fore.GREEN if is_success else Fore.RED
+                print(f"{color}      - {fname}")
+            print()
+            total_files += date_count
+            successful += date_success
+            unsuccessful += date_fail
+            total_measurements += date_measurements
+            total_snr_sum += date_snr_sum
+        else:
+            print(f"{Fore.YELLOW}  {date_str}: подходящих логов нет")
+            print()
+
+        current_date += timedelta(days=1)
+
+    overall_avg = (total_snr_sum / total_measurements) if total_measurements > 0 else 0.0
+    print(f"{Fore.CYAN + Style.BRIGHT}\nИТОГО")
+    print(f"{Fore.CYAN}Файлов: {total_files}, Успешных: {successful}, Пустых: {unsuccessful}, Средний SNR: {overall_avg:.2f}")
 
 # Получает график пролета через браузер (Playwright/Pyppeteer) и сохраняет как PNG
 async def get_log_graph(station_name: str, log_filename: str, output_dir: Path):
@@ -2384,7 +2568,9 @@ def analyze_downloaded_logs(target_date: str) -> None:
         # но можно переопределить через config.json -> email.* или переменные окружения)
         try:
             email_settings = get_email_settings(config)
-            if email_settings.get("enabled"):
+            if EMAIL_DISABLED:
+                logger.info("Email отключен флагом -OffEmail, отправка пропущена")
+            elif email_settings.get("enabled"):
                 subject = "Сводка работы станций"
                 # Генерируем сводный график общего % пустых за 7 дней
                 summary_chart_path = graphs_dir / "overall_unsuccessful_7d.png"
@@ -2445,7 +2631,8 @@ def load_stations_from_config_for_analysis(config_path: Path = Path("/root/loret
             
             for station in config.get('stations', []):
                 station_name = station['name']
-                stations_dict[station_name] = station.get('type', 'oper')
+                # type (oper/reg) больше не нужен для анализа, сохраняем заглушку
+                stations_dict[station_name] = "station"
                 # Используем "bend" или "range" (для обратной совместимости)
                 bend_type = station.get('bend') or station.get('range')
                 if bend_type:
@@ -2537,11 +2724,18 @@ def scheduler_loop():
             
             # Вычисляем время до следующей полуночи UTC
             next_midnight_utc = (now_utc + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-            if now_utc.hour == 0 and now_utc.minute == 0:
-                # Если уже 00:00, запускаем сразу
-                next_midnight_utc = now_utc.replace(second=0, microsecond=0)
+            # ВАЖНО: "полночь" — это ровно 00:00:00, а не вся минута 00:00.
+            # Иначе при 00:00:17 мы получаем next_midnight в прошлом (00:00:00),
+            # отрицательное wait_seconds и повторный запуск отчёта за тот же день.
+            if now_utc.hour == 0 and now_utc.minute == 0 and now_utc.second == 0:
+                # Если уже ровно 00:00:00, запускаем сразу
+                next_midnight_utc = now_utc.replace(microsecond=0)
             
             wait_seconds = (next_midnight_utc - now_utc).total_seconds()
+            if wait_seconds < 0:
+                # На всякий случай: если next_midnight оказался в прошлом, переносим на следующий день
+                next_midnight_utc = (now_utc + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+                wait_seconds = (next_midnight_utc - now_utc).total_seconds()
             
             # Если до полуночи меньше минуты, запускаем сразу
             if wait_seconds < 60:
@@ -2593,6 +2787,76 @@ def scheduler_loop():
 
 if __name__ == "__main__":
     import sys
+    # Флаг: отключить отправку email
+    if "-OffEmail" in sys.argv or "--off-email" in sys.argv:
+        EMAIL_DISABLED = True
+        sys.argv = [arg for arg in sys.argv if arg not in ("-OffEmail", "--off-email")]
+
+    # Флаг: статистика по выбранным спутникам за период
+    if "--stat-commers" in sys.argv:
+        EMAIL_DISABLED = True
+        idx = sys.argv.index("--stat-commers")
+        args = sys.argv[idx + 1 :]
+        if not args:
+            print(f"{Fore.RED}Ошибка: укажите станцию. Пример: --stat-commers R2.0S_Moscow 20250101 20250110")
+            sys.exit(1)
+
+        station_name = args[0]
+        start_str = args[1] if len(args) >= 2 else datetime.now(timezone.utc).strftime("%Y%m%d")
+        end_str = args[2] if len(args) >= 3 else start_str
+
+        try:
+            start_date = datetime.strptime(start_str, "%Y%m%d")
+            end_date = datetime.strptime(end_str, "%Y%m%d")
+        except ValueError:
+            print(f"{Fore.RED}Ошибка: даты должны быть в формате YYYYMMDD")
+            sys.exit(1)
+
+        if end_date < start_date:
+            print(f"{Fore.RED}Ошибка: конечная дата не может быть раньше начальной")
+            sys.exit(1)
+
+        satellites = _load_commercial_satellites()
+        analyze_satellite_logs_for_station(
+            station_name=station_name,
+            start_date=start_date,
+            end_date=end_date,
+            satellites=satellites,
+        )
+        sys.exit(0)
+
+    # Флаг: статистика по всем пролетам за период
+    if "--stat-all" in sys.argv:
+        EMAIL_DISABLED = True
+        idx = sys.argv.index("--stat-all")
+        args = sys.argv[idx + 1 :]
+        if not args:
+            print(f"{Fore.RED}Ошибка: укажите станцию. Пример: --stat-all R2.0S_Moscow 20250101 20250110")
+            sys.exit(1)
+
+        station_name = args[0]
+        start_str = args[1] if len(args) >= 2 else datetime.now(timezone.utc).strftime("%Y%m%d")
+        end_str = args[2] if len(args) >= 3 else start_str
+
+        try:
+            start_date = datetime.strptime(start_str, "%Y%m%d")
+            end_date = datetime.strptime(end_str, "%Y%m%d")
+        except ValueError:
+            print(f"{Fore.RED}Ошибка: даты должны быть в формате YYYYMMDD")
+            sys.exit(1)
+
+        if end_date < start_date:
+            print(f"{Fore.RED}Ошибка: конечная дата не может быть раньше начальной")
+            sys.exit(1)
+
+        analyze_satellite_logs_for_station(
+            station_name=station_name,
+            start_date=start_date,
+            end_date=end_date,
+            satellites=None,
+        )
+        sys.exit(0)
+
     # Проверяем, запущен ли скрипт в режиме планировщика
     if len(sys.argv) >= 2 and sys.argv[1] == "--scheduler":
         scheduler_loop()
