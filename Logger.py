@@ -1,55 +1,76 @@
-import logging
+﻿import logging
 import coloredlogs
-from datetime import datetime  
+from datetime import datetime
 
 
 class Logger:
-    '''Класс отвечающий за логирование. Логи пишуться в файл, так же выводться в консоль'''
+    '''Класс для ведения логов. Записи сохраняются в файл и дублируются в консоль.'''
 
-    def __init__(self,config):
-        log_level = {'debug':logging.DEBUG,
-                     'info':logging.INFO,
-                     'warning':logging.WARNING,
-                     'critical':logging.CRITICAL,
-                     'error':logging.ERROR}
-                     
-        self.logs = logging.getLogger(__name__)
-        self.logs.setLevel(log_level[config['log_level']])
+    def __init__(self, path_log, log_level='info', logger_name=None):
+        """Инициализирует логгер.
 
-        # название файла 
-        name = config['path_log'] + '-'.join('-'.join('-'.join(str(datetime.now()).split()).split('.')).split(':')) + '.log'
+        Args:
+            path_log: Базовый путь/префикс имени лог-файла.
+            log_level: Уровень логирования строкой (debug, info, warning, error, critical).
+            logger_name: Имя логгера; если не задано, используется имя модуля.
+        """
+        
+        # Соответствие строковых уровней и констант logging.
+        log_level_map = {'debug':logging.DEBUG,
+                         'info':logging.INFO,
+                         'warning':logging.WARNING,
+                         'critical':logging.CRITICAL,
+                         'error':logging.ERROR}
 
-        # обработчик записи в лог-файл
+        # Имя логгера: берём указанное или имя текущего модуля.
+        logger_name = logger_name or __name__
+        self.logs = logging.getLogger(logger_name)
+        self.logs.setLevel(log_level_map[log_level])
+
+        # Имя лог-файла с меткой текущей даты и времени.
+        name = path_log + '-'.join('-'.join('-'.join(str(datetime.now()).split()).split('.')).split(':')) + '.log'
+
+        # Обработчик для записи в файл.
         self.file = logging.FileHandler(name)
         self.fileformat = logging.Formatter("%(asctime)s : %(levelname)s : %(message)s")
-        self.file.setLevel(log_level[config['log_level']])
+        self.file.setLevel(log_level_map[log_level])
         self.file.setFormatter(self.fileformat)
 
-        # обработчик вывода в консоль лог файла
+        # Обработчик для вывода в консоль.
         self.stream = logging.StreamHandler()
         self.streamformat = logging.Formatter(
             "%(levelname)s:%(module)s:%(message)s")
-        self.stream.setLevel(log_level[config['log_level']])
+        self.stream.setLevel(log_level_map[log_level])
         self.stream.setFormatter(self.streamformat)
 
-        # инициализация обработчиков
+        # Регистрируем обработчики и включаем цветной вывод.
         self.logs.addHandler(self.file)
         self.logs.addHandler(self.stream)
-        coloredlogs.install(level=log_level[config['log_level']], logger=self.logs, fmt='%(asctime)s : %(levelname)s : %(message)s')
+        coloredlogs.install(level=log_level_map[log_level], logger=self.logs, fmt='%(asctime)s : %(levelname)s : %(message)s')
 
-        self.logs.info('Start logging') 
+        # Стартовое сообщение для проверки работы логгера.
+        self.logs.info('Start logging')
 
     def debug(self, message):
+        """Логирует отладочное сообщение."""
         self.logs.debug(message)
 
     def info(self, message):
+        """Логирует информационное сообщение."""
         self.logs.info(message)
 
     def warning(self, message):
+        """Логирует предупреждение."""
         self.logs.warning(message)
 
     def critical(self, message):
+        """Логирует критическое сообщение."""
         self.logs.critical(message)
+    
+    def exception(self, message, exc_info=None):
+        """Логирует исключение."""
+        self.logs.exception(message, exc_info=exc_info)
 
     def error(self, message):
+        """Логирует сообщение об ошибке."""
         self.logs.error(message)
