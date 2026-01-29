@@ -1,6 +1,7 @@
-﻿import logging
+import logging
 import coloredlogs
 from datetime import datetime
+import os
 
 
 class Logger:
@@ -27,26 +28,36 @@ class Logger:
         self.logs = logging.getLogger(logger_name)
         self.logs.setLevel(log_level_map[log_level])
 
+        # Проверяем, что директория path_log существует.
+        if path_log:
+            dir_path = os.path.dirname(path_log)
+            if dir_path:
+                os.makedirs(dir_path, exist_ok=True)
+
         # Имя лог-файла с меткой текущей даты и времени.
-        name = path_log + '-'.join('-'.join('-'.join(str(datetime.now()).split()).split('.')).split(':')) + '.log'
+        name = path_log + logger_name + '-' + '-'.join('-'.join('-'.join(str(datetime.now()).split()).split('.')).split(':')) + '.log'
 
         # Обработчик для записи в файл.
-        self.file = logging.FileHandler(name)
-        self.fileformat = logging.Formatter("%(asctime)s : %(levelname)s : %(message)s")
+        self.file = logging.FileHandler(name, encoding="utf-8")
+        self.fileformat = logging.Formatter("%(asctime)s : %(levelname)s : %(name)s : %(message)s")
         self.file.setLevel(log_level_map[log_level])
         self.file.setFormatter(self.fileformat)
 
         # Обработчик для вывода в консоль.
         self.stream = logging.StreamHandler()
         self.streamformat = logging.Formatter(
-            "%(levelname)s:%(module)s:%(message)s")
+            "%(levelname)s:%(name)s:%(message)s")
         self.stream.setLevel(log_level_map[log_level])
         self.stream.setFormatter(self.streamformat)
 
         # Регистрируем обработчики и включаем цветной вывод.
         self.logs.addHandler(self.file)
         self.logs.addHandler(self.stream)
-        coloredlogs.install(level=log_level_map[log_level], logger=self.logs, fmt='%(asctime)s : %(levelname)s : %(message)s')
+        coloredlogs.install(
+            level=log_level_map[log_level],
+            logger=self.logs,
+            fmt="%(asctime)s : %(levelname)s : %(name)s : %(message)s",
+        )
 
         # Стартовое сообщение для проверки работы логгера.
         self.logs.info('Start logging')

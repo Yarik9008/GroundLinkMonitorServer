@@ -1,0 +1,508 @@
+from __future__ import annotations
+import os
+import re
+from datetime import datetime
+from sqlite3 import paramstyle
+from typing import Iterable, Optional
+from Logger import Logger
+from SatPass import SatPas
+
+
+class PassAnalyzer:
+    """Анализатор лог-файлов пролетов.
+
+    Назначение:
+        - Читает лог-файлы по `log_path`.
+        - Определяет окно приема по SNR-порогам.
+        - Заполняет SNR-метрики, время приема и время пролета.
+
+    Ключевая логика:
+        - Порог старта: SNR первой строки + 3.
+        - Старт: первая строка, где SNR > порога старта.
+        - Порог завершения: SNR в момент старта + 3.
+        - Конец: первая строка после последнего значения >= порога завершения,
+          где SNR < порога завершения.
+    """
+
+    # Инициализация анализатора
+    def __init__(self, logger: Logger) -> None:
+        if logger is None:
+            raise ValueError("logger is required")
+
+        self.logger = logger
+
+        # пороговый уровень SNR по умолчанию 
+        self.snr_trigger_level = 6
+
+    # возврвщает параметры лог файла 
+    def extract_pass_params(self, log_lines: list) -> dict:
+        """Парсит заголовок лога и возвращает ключевые параметры."""
+        pass_id = None
+        satellite = None
+        start_time = None
+        pass_date = None
+        stop_time = None
+        station = None
+        location = None
+
+        data_lines = []
+        for line in log_lines:
+
+            line = line.strip()
+            # сохраняем строки с данными
+            if line and not line.startswith("#"):
+                data_lines.append(line)
+            # пропускаем строки, не начинающиеся с #
+            if not line.startswith("#"):
+                continue
+
+            # извлекаем параметры пролета
+            # извлекаем ID пролета
+            if line.startswith("#Pass ID:"):
+                pass_id = line.split(":", 1)[1].strip()
+
+            # извлекаем название спутника
+            elif line.startswith("#Satellite:"):
+                satellite = line.split(":", 1)[1].strip()
+
+            # извлекаем время старта
+            elif line.startswith("#Start time:"):
+                raw_value = line.split(":", 1)[1].strip()
+                try:
+                    start_time = datetime.fromisoformat(raw_value)
+                    pass_date = start_time.date().isoformat()
+                except ValueError:
+                    start_time = raw_value
+                    try:
+                        pass_date = datetime.fromisoformat(raw_value[:10]).date().isoformat()
+                    except ValueError:
+                        pass_date = None
+
+            # извлекаем название станции
+            elif line.startswith("#Station:"):
+
+                station = line.split(":", 1)[1].strip()
+
+            # извлекаем координаты станции
+            elif line.startswith("#Location:"):
+                raw_location = line.split(":", 1)[1].strip()
+                tokens = raw_location.split()
+                if len(tokens) >= 2:
+                    try:
+                        if "lon" in tokens and "lat" in tokens:
+                            lon_idx = tokens.index("lon")
+                            lat_idx = tokens.index("lat")
+                            lon = float(tokens[lon_idx - 1]) if lon_idx > 0 else None
+                            lat = float(tokens[lat_idx - 1]) if lat_idx > 0 else None
+                        else:
+                            lon = float(tokens[0])
+                            lat = float(tokens[1])
+
+                        if lon is None or lat is None:
+                            raise ValueError("longitude/latitude not found")
+
+                        location = (lat, lon)
+
+                        self.logger.debug(f"Location: {location}")  
+
+                    except (ValueError, IndexError) as exc:
+                        self.logger.debug(f"Error: {exc}")
+                        location = None
+
+                else:
+                    self.logger.debug(f"Error: {len(tokens)}")
+                    location = None
+                    self.logger.debug(f"Location: {location}")
+
+            # извлекаем время окончания приема
+            elif line.startswith("#Closed at:"):
+                raw_value = line.split(":", 1)[1].strip()
+                try:
+                    stop_time = datetime.fromisoformat(raw_value)
+
+                except ValueError:
+                    stop_time = raw_value
+
+        # Проверяем последнюю строку данных и при необходимости обновляем stop_time.
+        if len(data_lines) >= 1:
+            last_line = data_lines[-1].split()
+            if len(last_line) >= 2:
+                raw_time = f"{last_line[0]} {last_line[1]}"
+                try:
+                    last_time = datetime.fromisoformat(raw_time)
+                except ValueError:
+                    last_time = None
+
+                if last_time is not None:
+                    if isinstance(stop_time, datetime):
+                        if last_time > stop_time:
+                            stop_time = last_time
+                    elif stop_time is None:
+                        stop_time = last_time
+
+
+        # возвращаем параметры пролета
+        return {
+            "pass_id": pass_id,
+            "satellite": satellite,
+            "start_time": start_time,
+            "pass_date": pass_date,
+            "station": station,
+            "location": location,
+            "stop_time": stop_time,
+        }
+
+    # парсит строки записей лога и возвращает список с числовыми значениями
+    def parse_lines(self, log_lines: list) -> list:
+        """Парсит строки записей лога и возвращает список списков."""
+        headers = None
+        rows = []
+        in_records = False
+
+        for line in log_lines:
+            # Убираем переводы строк и пробелы по краям.
+            line = line.strip()
+            if not line:
+                continue
+
+            if line.startswith("#Closed at:"):
+                # Маркер окончания записей — выходим из цикла.
+                break
+
+            if line.startswith("#"):
+                if line.startswith("#Time"):
+                    # Считываем заголовок таблицы и включаем режим чтения записей.
+                    header_line = line[1:].strip()
+                    headers = header_line.split()
+                    in_records = True
+                continue
+
+            if not in_records or not headers:
+                # Пока не дошли до заголовка — записи не парсим.
+                continue
+
+            parts = line.split()
+            if not parts:
+                continue
+
+            if headers[0] == "Time" and len(parts) == len(headers) + 1:
+                # Дата и время разделены на два токена — склеиваем их.
+                time_value = f"{parts[0]} {parts[1]}"
+                values = [time_value] + parts[2:]
+            else:
+                values = parts
+
+            if len(values) != len(headers):
+                # Если число значений не совпадает с заголовком, строку пропускаем.
+                self.logger.warning(f"unexpected log line format: {line}")
+                continue
+
+            numeric_values = []
+            for idx, raw_value in enumerate(values):
+                if headers[idx] == "Time":
+                    try:
+                        # Время парсим в datetime.
+                        dt_value = datetime.fromisoformat(raw_value)
+                        numeric_values.append(dt_value)
+                    except ValueError:
+                        numeric_values = []
+                        break
+                else:
+                    try:
+                        # Остальные поля пытаемся привести к float.
+                        numeric_values.append(float(raw_value))
+                    except ValueError:
+                        numeric_values = []
+                        break
+
+            if not numeric_values:
+                # Если парсинг хотя бы одного поля не удался — строку пропускаем.
+                self.logger.warning(f"unexpected log line format: {line}")
+                continue
+
+            # Добавляем строку с распарсенными значениями.
+            rows.append(numeric_values)
+
+        if headers is None:
+            # Заголовок не найден — возвращаем пустой результат.
+            return []
+
+        # Первая строка результата — заголовок, далее данные.
+        return [headers] + rows
+
+    # извлекает SNR-метрики из списка строк
+    def extract_snr_metrics(self, rows: list) -> dict:
+        """Извлекает SNR-метрики из списка списков."""
+        if not rows:
+            # Нет данных — возвращаем пустые метрики.
+            self.logger.debug("Нет данных")
+            return {
+                "snr_sum": None,
+                "snr_awg": None,
+                "snr_max": None,
+                "rx_start_time": None,
+                "rx_end_time": None,
+                "success": False,
+            }
+
+        # Первый элемент — заголовок, далее строки данных.
+        headers = rows[0]
+        data_rows = rows[1:]
+        if not data_rows:
+            # Заголовок есть, данных нет.
+            self.logger.debug("Заголовок есть, данных нет")
+            return {
+                "snr_sum": None,
+                "snr_awg": None,
+                "snr_max": None,
+                "rx_start_time": None,
+                "rx_end_time": None,
+                "success": False,
+            }
+
+        # Определяем индекс столбца SNR.
+        try:
+            # индекс н
+            snr_idx = headers.index("SNR")
+            self.logger.debug(f"SNR column found at index: {snr_idx}")
+
+        except ValueError:
+            self.logger.warning("SNR column not found in log headers")
+            return {
+                "snr_sum": None,
+                "snr_awg": None,
+                "snr_max": None,
+                "rx_start_time": None,
+                "rx_end_time": None,
+                "success": False,
+            }
+
+        # Определяем индекс столбца Time.
+        time_idx = 0 if headers and headers[0] == "Time" else None
+        if time_idx is None:
+            try:
+                time_idx = headers.index("Time")
+            except ValueError:
+                self.logger.warning("Time column not found in log headers")
+                return {
+                    "snr_sum": None,
+                    "snr_awg": None,
+                    "snr_max": None,
+                    "rx_start_time": None,
+                    "rx_end_time": None,
+                    "success": False,
+                }
+
+        # Определяем индекс столбца State, если он есть.
+        try:
+            state_idx = headers.index("State")
+        except ValueError:
+            state_idx = None
+
+        # Временные границы приема и массивы SNR.
+        rx_start_time = None
+        rx_end_time = None
+        snr_window = []  # SNR внутри окна приема
+        snr_all = []     # SNR по всем строкам
+        state_used = False
+        seen_nonzero_state = False
+
+        for row in data_rows:
+            # Защита от строк неправильной длины.
+            if len(row) <= max(time_idx, snr_idx):
+                continue
+            time_value = row[time_idx]
+            snr_value = row[snr_idx]
+            snr_all.append(snr_value)
+
+            if state_idx is not None and len(row) > state_idx:
+                # Если есть State, определяем окно приема по нему.
+                state_value = row[state_idx]
+                if state_value != 0:
+                    seen_nonzero_state = True
+
+                if seen_nonzero_state and state_value == 0:
+                    if rx_start_time is None:
+                        rx_start_time = time_value
+                    rx_end_time = time_value
+                    snr_window.append(snr_value)
+                    state_used = True
+            else:
+                # Окно приема по SNR-порогу.
+                if snr_value >= self.snr_trigger_level:
+                    if rx_start_time is None:
+                        rx_start_time = time_value
+                    rx_end_time = time_value
+                    snr_window.append(snr_value)
+
+        if snr_window:
+            # Есть окно приема — считаем метрики по нему.
+            sum_snr = sum(snr_window)
+            max_snr = max(snr_window)
+            awg_snr = round(sum_snr / len(snr_window), 2)
+            success = True
+        elif snr_all:
+            # Окно приема не найдено — считаем по всем строкам.
+            sum_snr = sum(snr_all)
+            max_snr = max(snr_all)
+            awg_snr = round(sum_snr / len(snr_all), 2)
+            success = False
+        else:
+            # Нет валидных чисел SNR.
+            sum_snr = None
+            max_snr = None
+            awg_snr = None
+            success = False
+
+        # Возвращаем метрики и временные границы приема.
+        return {
+            "snr_sum": sum_snr,
+            "snr_awg": awg_snr,
+            "snr_max": max_snr,
+            "rx_start_time": rx_start_time,
+            "rx_end_time": rx_end_time,
+            "success": success,
+        }
+
+    # Анализ пролета и заполнение полей SatPas
+    def analyze_passes(self, passes: Iterable[SatPas]) -> list[SatPas]:
+        """Анализирует логи пролетов и заполняет поля SatPas.
+
+        Args:
+            passes: Список объектов SatPas.
+
+        Returns:
+            list[SatPas]: Тот же список SatPas с заполненными полями.
+        """
+        result = []
+
+        for sat_pass in passes:
+
+            # Проверка наличия лог-файла
+            if not sat_pass.log_path:
+                raise FileNotFoundError("log file not found: log_path is empty")
+            else: 
+                self.logger.debug("Путь к лог файлу найден:")
+                self.logger.debug(sat_pass.log_path)
+
+            # Открытие указанного лог-файла для дальнейшего чтения.
+            try:
+                with open(sat_pass.log_path, "r", encoding="utf-8") as log_file:
+                    self.logger.debug("Лог-файл успешно открыт для чтения")
+                    self.logger.debug(log_file.name)
+                    lines = log_file.readlines()
+
+            except FileNotFoundError as exc:
+                raise FileNotFoundError(f"log file not found: {sat_pass.log_path}") from exc
+
+            except OSError as exc:
+                raise OSError(f"failed to read log file: {sat_pass.log_path}") from exc
+
+            # заполняем параметры пролета 
+            params = {
+                **self.extract_pass_params(lines),
+                **self.extract_snr_metrics(self.parse_lines(lines)),
+            }
+            print(params)
+
+            sat_pass.pass_id = params["pass_id"]
+            sat_pass.satellite_name = params["satellite"]
+            sat_pass.pass_date = params["pass_date"]
+            sat_pass.pass_start_time = params["start_time"]
+            sat_pass.station_name = params["station"]
+            sat_pass.location = params["location"]
+            sat_pass.pass_end_time = params["stop_time"]
+            sat_pass.snr_sum = params["snr_sum"]
+            sat_pass.snr_awg = params["snr_awg"]
+            sat_pass.snr_max = params["snr_max"]
+            sat_pass.rx_start_time = params["rx_start_time"]
+            sat_pass.rx_end_time = params["rx_end_time"]
+            sat_pass.success = params["success"]
+
+            print(sat_pass)
+            result.append(sat_pass)
+
+        return result
+
+
+if __name__ == "__main__":
+    LOG_PATH  = "C:\\Users\\Yarik\\YandexDisk\\Engineering_local\\Soft\\GroundLinkMonitorServer\\server_logs\\"
+
+    #test 1 20260127_031121_FENGYUN_3D
+    print("test 1 20260127_031121_FENGYUN_3D")
+    print("--------------------------------")
+    print()
+    # Мини-тест аналитики на одном лог-файле, если он существует.
+    sample_log = (
+        "C:\\Users\\Yarik\\YandexDisk\\Engineering_local\\Soft\\GroundLinkMonitorServer\\passes_logs\\2026\\01\\27\\R4.6S_Anadyr\\R4.6S_Anadyr__20260127_031121_FENGYUN_3D_rec.log"
+    )
+    if os.path.exists(sample_log):
+
+        logger = Logger(path_log=LOG_PATH, log_level="debug", logger_name="ground_link_analyzer")
+        analyzer = PassAnalyzer(logger=logger)
+        test_pass = SatPas(log_path=sample_log)
+        analyzed = analyzer.analyze_passes([test_pass])
+        print(analyzed)
+
+    else:
+
+        print(f"test log not found: {sample_log}")
+
+    #test 2 PlanumMoscow__20260127_072847_METEOR-M2_3
+
+    print("test 2 PlanumMoscow__20260127_072847_METEOR-M2_3")
+    print("--------------------------------")
+    print()
+
+    sample_log = (
+        "C:\\Users\\Yarik\\YandexDisk\\Engineering_local\\Soft\\GroundLinkMonitorServer\\passes_logs\\2026\\01\\27\\PlanumMoscow\\PlanumMoscow__20260127_072847_METEOR-M2_3_rec.log"
+    )
+    if os.path.exists(sample_log):
+
+        test_pass = SatPas(log_path=sample_log)
+        analyzed = analyzer.analyze_passes([test_pass])
+        print(analyzed)
+
+    else:
+
+        print(f"test log not found: {sample_log}")
+
+    # test 3 R3.2S-Naryan-Mar__20260129_070456_NOAA_20_JPSS-1
+
+    print()
+    print("test 3 R3.2S-Naryan-Mar__20260129_070456_NOAA_20_JPSS-1")
+    print("--------------------------------")
+    print()
+
+    sample_log = ( "C:\\Users\\Yarik\\YandexDisk\\Engineering_local\\Soft\\GroundLinkMonitorServer\\passes_logs\\2026\\01\\29\\R3.2S-Naryan-Mar\\R3.2S-Naryan-Mar__20260129_070456_NOAA_20_JPSS-1_rec.log"
+    )
+
+    if os.path.exists(sample_log):
+
+        test_pass = SatPas(log_path=sample_log)
+        analyzed = analyzer.analyze_passes([test_pass])
+        print(analyzed)
+
+    else:
+
+        print(f"test log not found: {sample_log}")
+
+    # test 4 PlanumMoscow__20260129_082629_METOP-C
+
+    print()
+    print("test 4 PlanumMoscow__20260129_082629_METOP-C")
+    print("--------------------------------")
+    print()
+
+    sample_log = (
+        "C:\\Users\\Yarik\\YandexDisk\\Engineering_local\\Soft\\GroundLinkMonitorServer\\passes_logs\\2026\\01\\29\\PlanumMoscow\\PlanumMoscow__20260129_082629_METOP-C_rec.log"
+    )
+    if os.path.exists(sample_log):
+
+        test_pass = SatPas(log_path=sample_log)
+        analyzed = analyzer.analyze_passes([test_pass])
+        print(analyzed) 
+
+    else:
+
+        print(f"test log not found: {sample_log}")

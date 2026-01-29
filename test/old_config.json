@@ -1,0 +1,103 @@
+{
+  "headers": {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+
+  },
+  "email": {
+    "enabled": true,
+    "smtp_server": "smtp.yandex.ru",
+    "smtp_port": 465,
+    "sender_email": "iaroslav.muhatdinov@yandex.ru",
+    "sender_password": "nxrxodmvlgkreewp",
+    "recipient_email": "ogershenzon@gmail.com",
+    "debug_recipient": "eyenot2@yandex.ru",
+    "cc": ["vegershenzon@gmail.com", 
+           "lpmrfentazis@mail.ru",
+           "edanilov.18@yandex.ru",
+           "yunina@lorett.org",
+           "project@lorett.org",
+           "m.uzhakhova@lorett.org",
+           "lv2005@mail.ru",
+           "a.v.shumilin@yandex.ru",
+           "k.sevinyan@lorett.org",
+           "var@list.ru",
+           "m.akhriev@lorett.org",
+           "artemiypanarin@yandex.ru",
+           "m.klyshkin@ya.ru",
+           "i.kurakina@lorett.org"
+          ]
+  },
+
+  "constants": {
+    "min_log_file_size": 100,
+    "min_avg_snr_threshold": 4.0,
+    "x_bend_failure_threshold": 6.1,
+    "l_bend_failure_threshold": 0.0,
+    "request_timeout": 30,
+    "max_concurrent_downloads": 10,
+    "graph_viewport_width": 620,
+    "graph_viewport_height": 640,
+    "graph_load_delay": 0.5,
+    "graph_scroll_x": 0,
+    "graph_scroll_y": 30
+  },
+  "commercial_satellites": [
+    "TY-39",
+    "TY-40",
+    "TY-42",
+    "2025-108B",
+    "2024-110A",
+    "TEE-04A",
+    "TEE-01B",
+    "JILIN-1_GAOFEN_4A"
+  ],
+  "telegram_comm": {
+    "api_id": 25004944,
+    "api_hash": "3d29770555fbca4b0ea880003ed892bc",
+    "channel": "https://t.me/+Lb1SuoOUlodhYTli",
+    "session": "/root/lorett/GroundLinkMonitorServer/telegram",
+    "db_path": "/root/lorett/GroundLinkMonitorServer/comm_passes.db"
+  },
+  "stations": [
+    {
+      "name": "PlanumMoscow",
+      "bend": "L"
+    },
+    {
+      "name": "planumMaritime01",
+      "bend": "L"
+    },
+    {
+      "name": "R2.0S_Moscow",
+      "bend": "X"
+    },
+    {
+      "name": "R2M6_AANII_01",
+      "bend": "X"
+    },
+    {
+      "name": "R3.2S_Murmansk",
+      "bend": "X"
+    },
+    {
+      "name": "R3.0SM8_Murmansk_STILSPACE",
+      "bend": "X"
+    },
+    {
+      "name": "T1",
+      "bend": "X"
+    },
+    {
+      "name": "R4.6S_Anadyr",
+      "bend": "X"
+    },
+    {
+      "name": "XPeterburg",
+      "bend": "X"
+    },
+    {
+      "name": "Regia",
+      "bend": "X"
+    }
+  ]
+}
